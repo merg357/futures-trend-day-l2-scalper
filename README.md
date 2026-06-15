@@ -37,9 +37,13 @@ futures-trend-day-l2-scalper/
 
 CSV columns (required): `timestamp`, `open`, `high`, `low`, `close`, `volume`
 
-Optional L2 columns: `bid_size`, `ask_size`, `bid_depth`, `ask_depth`, `delta`
+Optional L2 columns: `bid`, `ask`, `bid_size`, `ask_size`, `bid_depth`, `ask_depth`, `delta`
 
 When L2 columns are missing, the backtester enables **approximation mode** (derived from OHLCV) and records a warning in reports.
+
+### Live paper feed (Windows VPS)
+
+NinjaTrader 8 **ScalperL2Exporter** writes the follow-mode CSV from the NT8 Rithmic/sim L2 stream. See `integrations/ninjatrader8/README.md` and `deploy/windows/CURSOR_VPS_SETUP.md`.
 
 ## Reports
 

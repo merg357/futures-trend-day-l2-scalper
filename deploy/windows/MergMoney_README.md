@@ -1,214 +1,121 @@
-# MergMoney Windows VPS — Paper Bot Deploy
+# MergMoney Windows VPS — NT8 L2 Paper Bot
 
 **VM:** MergMoney · **Host:** `160.187.32.113` · **Port:** `36936` (RDP)  
-**Safety:** `PAPER_ONLY=true` and `LIVE_TRADING=false` — no live broker orders.
+**Safety:** `PAPER_ONLY=true` · `LIVE_TRADING=false` — no live broker orders.
 
 ---
 
-## Connection test results (from workstation)
+## Live feed source: NinjaTrader 8 (not futuresbot)
+
+| Source | Use |
+|--------|-----|
+| **NT8 ScalperL2Exporter** | Live paper follow (`BAR_CSV_PATH`) |
+| futuresbot L2 archives | Offline backtest ETL only (`FUTURESBOT_ARCHIVE_ROOT`) |
+
+```
+NT8 + Rithmic → ScalperL2Exporter → nt8_mnq_1m.csv → paper_runner follow
+```
+
+---
+
+## Connection test (workstation)
 
 | Test | Result |
 |------|--------|
-| `Test-NetConnection 160.187.32.113 -Port 36936` | **TcpTestSucceeded: True** |
-| ICMP ping | Failed (common on VPS — ignore if TCP works) |
-| SSH on port 36936 | **Failed** — connection reset (port is RDP, not OpenSSH) |
+| `Test-NetConnection 160.187.32.113 -Port 36936` | TcpTestSucceeded (RDP) |
+| SSH on 36936 | Fails — port is RDP |
 
-**Conclusion:** Deploy must be done **inside the VPS via RDP**. Remote SSH/SCP from this PC is not available on port 36936.
-
----
-
-## Step 1 — Connect via RDP
-
-1. Open Remote Desktop Connection (`Win+R` → `mstsc`).
-2. **Computer:** `160.187.32.113:36936`
-3. **User:** `tradervps`
-4. Enter your VPS password when prompted (never save it in repo files).
-
-Optional — save a `.rdp` file locally (password stored only in Windows Credential Manager, not in git):
-
-```
-full address:s:160.187.32.113:36936
-username:s:tradervps
-```
+Deploy **inside the VPS via RDP**.
 
 ---
 
-## Step 2 — Copy project to the VPS
+## Step 1 — RDP
 
-The scalper is not yet a standalone git repo on GitHub. Use one of:
-
-### Option A — RDP drive redirect (recommended)
-
-1. In `mstsc`, **Local Resources → More** → enable your dev drive (e.g. `D:`).
-2. On the VPS, copy from `\\tsclient\D\AI_Vault\workspace\jarvis-one\futures-trend-day-l2-scalper` to:
-
-   `C:\Temp\futures-trend-day-l2-scalper`
-
-### Option B — Zip transfer
-
-1. Zip `futures-trend-day-l2-scalper` on your PC (exclude `.venv`, `__pycache__`, `.env`).
-2. Copy zip via RDP clipboard/USB/cloud, extract to `C:\Temp\futures-trend-day-l2-scalper`.
-
-### Option C — Git clone (when published)
-
-```powershell
-git clone --depth 1 <your-repo-url> C:\Temp\jarvis-one
-# then use -SourceRoot C:\Temp\jarvis-one\futures-trend-day-l2-scalper
-```
+1. `mstsc` → `160.187.32.113:36936` → user `tradervps`.
 
 ---
 
-## Step 3 — Run one-shot install (on VPS)
-
-Open **PowerShell as Administrator** on the VPS:
+## Step 2 — Clone repo on VPS
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass -Force
+New-Item -ItemType Directory -Path C:\Bots -Force | Out-Null
+git clone https://github.com/merg357/futures-trend-day-l2-scalper.git C:\Bots\futures-trend-day-l2-scalper
+Set-Location C:\Bots\futures-trend-day-l2-scalper
+```
 
-cd C:\Temp\futures-trend-day-l2-scalper
+Or copy via RDP drive redirect, then use `-SourceRoot`.
 
+---
+
+## Step 3 — Deploy Python + `.env`
+
+```powershell
 powershell -ExecutionPolicy Bypass -File .\deploy\windows\MergMoney_deploy.ps1 `
-  -SourceRoot "C:\Temp\futures-trend-day-l2-scalper" `
+  -SourceRoot "C:\Bots\futures-trend-day-l2-scalper" `
   -InstallRoot "C:\Bots\futures-trend-day-l2-scalper"
 ```
 
-This will:
-
-- Install Python 3.12 via winget if missing
-- Create `C:\TradeData\futuresbot\live\`
-- Install bot to `C:\Bots\futures-trend-day-l2-scalper`
-- Create `.env` with paper safety flags and production config path
-- **Not** write any VPS password to disk
-
-Production config used: `configs/production/mnq_walkforward_optimized.yaml`
+Creates venv, `data/live`, and `.env` with NT8 CSV paths.
 
 ---
 
-## Step 4 — NinjaTrader / futuresbot CSV path
+## Step 4 — NinjaTrader 8 + ScalperL2Exporter
 
-Point your L2 recorder to append 1-minute bars here:
+1. Install NT8; connect **Rithmic** (or sim).
+2. Copy strategy:
 
+   ```powershell
+   Copy-Item C:\Bots\futures-trend-day-l2-scalper\integrations\ninjatrader8\ScalperL2Exporter.cs `
+     "$env:USERPROFILE\Documents\NinjaTrader 8\bin\Custom\Strategies\"
+   ```
+
+3. NT8 → NinjaScript Editor → **F5** compile.
+4. **MNQ** chart → **1 Minute** → add **ScalperL2Exporter** (enabled).
+5. **ExportPath:** `C:\Bots\futures-trend-day-l2-scalper\data\live\nt8_mnq_1m.csv`
+
+Verify during RTH:
+
+```powershell
+Get-Content C:\Bots\futures-trend-day-l2-scalper\data\live\nt8_mnq_1m.csv -Tail 3
 ```
-C:\TradeData\futuresbot\live\MNQ_1m_live.csv
-```
 
-Required columns: `timestamp`, `open`, `high`, `low`, `close`, `volume`  
-Optional L2: `bid`, `ask`, `bid_size`, `ask_size`, `bid_depth`, `ask_depth`, `delta`
-
-Verify the file grows during RTH before starting the bot.
+Details: `integrations/ninjatrader8/README.md`
 
 ---
 
-## Step 5 — Start paper bot (manual first)
+## Step 5 — Start paper bot (after NT8 is writing CSV)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\Bots\futures-trend-day-l2-scalper\deploy\windows\run_paper_bot.ps1 `
   -InstallRoot "C:\Bots\futures-trend-day-l2-scalper"
 ```
 
-Expected console output includes:
-
-```
-Paper mode active (PAPER_ONLY=true, LIVE_TRADING=false)
-Starting paper runner: mode=follow symbol-config=...\mnq_walkforward_optimized.yaml
-```
-
-Monitor logs:
-
-| File | Purpose |
-|------|---------|
-| `C:\Bots\futures-trend-day-l2-scalper\data\live\signals.jsonl` | Entry signals |
-| `C:\Bots\futures-trend-day-l2-scalper\data\live\trades.jsonl` | Paper exits |
-| `C:\Bots\futures-trend-day-l2-scalper\data\live\gateway_audit.jsonl` | Blocked orders |
-
-Stop with `Ctrl+C`.
-
-Replay test (offline, no live CSV needed):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File C:\Bots\futures-trend-day-l2-scalper\deploy\windows\run_paper_bot.ps1 `
-  -InstallRoot "C:\Bots\futures-trend-day-l2-scalper" `
-  -Mode replay `
-  -DataPath "C:\Bots\futures-trend-day-l2-scalper\data\raw\MNQ_20260508_1m.csv"
-```
+| Log | Path |
+|-----|------|
+| Signals | `data\live\signals.jsonl` |
+| Trades | `data\live\trades.jsonl` |
+| Gateway | `data\live\gateway_audit.jsonl` |
 
 ---
 
-## Step 6 — Scheduled task (optional, after manual validation)
+## Step 6 — Scheduled task (optional)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\Bots\futures-trend-day-l2-scalper\deploy\windows\install_scheduled_task.ps1 `
   -InstallRoot "C:\Bots\futures-trend-day-l2-scalper"
 ```
 
-Or register during deploy:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\deploy\windows\MergMoney_deploy.ps1 `
-  -SourceRoot "C:\Temp\futures-trend-day-l2-scalper" `
-  -RegisterScheduledTask
-```
-
-Task name: `MNQ-Paper-Scalper` · Daily 09:25 · Runs `run_paper_bot.ps1`
-
-Remove task:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File C:\Bots\futures-trend-day-l2-scalper\deploy\windows\install_scheduled_task.ps1 -Unregister
-```
-
-### NSSM service (advanced, not required)
-
-If you prefer a Windows service instead of Task Scheduler:
-
-1. Download [NSSM](https://nssm.cc/download) to `C:\Tools\nssm\nssm.exe`.
-2. Service command:
-
-   ```
-   powershell.exe -ExecutionPolicy Bypass -NoProfile -File C:\Bots\futures-trend-day-l2-scalper\deploy\windows\run_paper_bot.ps1 -InstallRoot C:\Bots\futures-trend-day-l2-scalper
-   ```
-
-3. Set startup type Manual until paper logs look correct for several sessions.
+Ensure NT8 + strategy start before the task (~09:25).
 
 ---
 
-## What was deployed remotely vs manually
-
-| Action | From workstation | On VPS (RDP) |
-|--------|------------------|--------------|
-| TCP port test | Done — port open | — |
-| SSH deploy | **Not possible** (RDP port) | — |
-| Copy project | — | **You** (RDP drive/zip) |
-| `MergMoney_deploy.ps1` | Created in repo | **You** run it |
-| `.env` paper config | Template in script | Created on VPS |
-| Start paper bot | — | **You** run `run_paper_bot.ps1` |
-| Scheduled task | — | Optional, after validation |
-
----
-
-## Security reminders
-
-1. **Rotate the VPS password** after first RDP login if it was shared in chat.
-2. **Do not commit** `.env`, passwords, or RDP credentials to git.
-3. For repeat access, prefer **SSH key auth on a dedicated admin port** if your provider adds OpenSSH later — keep RDP restricted by firewall.
-4. Keep `PAPER_ONLY=true` until you have independently validated paper logs vs backtests.
-5. `LIVE_TRADING=false` — the default gateway stub does not send real orders even if flags change.
-
----
-
-## Quick reference — exact commands after RDP login
+## Quick reference
 
 ```powershell
-# 1. Copy project to C:\Temp\futures-trend-day-l2-scalper (via RDP drive), then:
-Set-ExecutionPolicy -Scope Process Bypass -Force
-cd C:\Temp\futures-trend-day-l2-scalper
-powershell -ExecutionPolicy Bypass -File .\deploy\windows\MergMoney_deploy.ps1 -SourceRoot "C:\Temp\futures-trend-day-l2-scalper"
-
-# 2. Confirm NinjaTrader CSV exists / will be written:
-Test-Path C:\TradeData\futuresbot\live\MNQ_1m_live.csv
-
-# 3. Start paper bot:
-powershell -ExecutionPolicy Bypass -File C:\Bots\futures-trend-day-l2-scalper\deploy\windows\run_paper_bot.ps1 -InstallRoot "C:\Bots\futures-trend-day-l2-scalper"
+# NT8 must be running first, then:
+powershell -ExecutionPolicy Bypass -File C:\Bots\futures-trend-day-l2-scalper\deploy\windows\run_paper_bot.ps1 -InstallRoot C:\Bots\futures-trend-day-l2-scalper
+Test-Path C:\Bots\futures-trend-day-l2-scalper\data\live\nt8_mnq_1m.csv
 ```
 
 ---
@@ -217,9 +124,8 @@ powershell -ExecutionPolicy Bypass -File C:\Bots\futures-trend-day-l2-scalper\de
 
 | Issue | Fix |
 |-------|-----|
-| `BAR_CSV_PATH not set` | Ensure `.env` exists; re-run deploy or set path in `.env` |
-| CSV not updating | Start NinjaTrader L2 recorder; confirm path matches `BAR_CSV_PATH` |
-| Python missing | Install 3.12 from python.org or re-run deploy (winget) |
-| RDP cannot connect | Confirm firewall allows 36936; verify IP/port with provider |
+| `Bar file missing` | Enable ScalperL2Exporter; check Rithmic connection |
+| Deprecated futuresbot path in `.env` | Use `nt8_mnq_1m.csv` under repo `data\live` |
+| No CSV rows | MNQ chart 1m; strategy enabled; market hours |
 
-See also: [deploy/windows/README.md](./README.md) for architecture and Linux VPS notes (`187.124.244.78` is a different host).
+See `CURSOR_VPS_SETUP.md` for full Cursor + env reference.

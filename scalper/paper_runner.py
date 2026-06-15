@@ -43,6 +43,29 @@ def _env_path(name: str, default: str) -> Path:
     return Path(os.getenv(name, default))
 
 
+def resolve_bar_csv_path(explicit: str = "") -> Path:
+    """Resolve live bar CSV from CLI, BAR_CSV_PATH, or NT8_EXPORT_PATH."""
+    if explicit.strip():
+        return Path(explicit.strip())
+    for name in ("BAR_CSV_PATH", "NT8_EXPORT_PATH"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return Path(value)
+    return Path("data/live/nt8_mnq_1m.csv")
+
+
+def _bar_csv_missing_message() -> str:
+    return (
+        "BAR_CSV_PATH (or NT8_EXPORT_PATH) is required.\n"
+        "Live L2 must come from NinjaTrader 8, not futuresbot recorder.\n"
+        "1) Copy integrations/ninjatrader8/ScalperL2Exporter.cs to "
+        "Documents\\NinjaTrader 8\\bin\\Custom\\Strategies\n"
+        "2) Compile in NT8 (F5) and enable on an MNQ 1-minute chart (Rithmic connected)\n"
+        "3) Set ExportPath / BAR_CSV_PATH to the same CSV (default: data/live/nt8_mnq_1m.csv)\n"
+        "See integrations/ninjatrader8/README.md"
+    )
+
+
 def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
@@ -273,7 +296,7 @@ def run_follow(
     warmup_bars: int = 100,
     gateway: LiveGateway | None = None,
 ) -> None:
-    """Follow a growing CSV (e.g. NinjaTrader L2 recorder output). Paper only."""
+    """Follow a growing CSV from NinjaTrader 8 ScalperL2Exporter. Paper only."""
     signals_path = log_dir / "signals.jsonl"
     trades_path = log_dir / "trades.jsonl"
     risk = RiskManager(config)
@@ -284,7 +307,10 @@ def run_follow(
 
     while True:
         if not data_path.exists():
-            logger.warning("Bar file missing: %s — waiting", data_path)
+            logger.warning(
+                "Bar file missing: %s — enable ScalperL2Exporter in NT8 (see integrations/ninjatrader8/README.md)",
+                data_path,
+            )
             time.sleep(poll_seconds)
             continue
 
@@ -334,7 +360,11 @@ def run_follow(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Paper/replay scalper runner (no live orders by default)")
     parser.add_argument("--config", default=os.getenv("SCALPER_CONFIG", "configs/production/mnq_walkforward_optimized.yaml"))
-    parser.add_argument("--data", default=os.getenv("BAR_CSV_PATH", ""), help="CSV bar file (replay or follow)")
+    parser.add_argument(
+        "--data",
+        default="",
+        help="CSV bar file (replay or follow). Defaults to BAR_CSV_PATH or NT8_EXPORT_PATH",
+    )
     parser.add_argument("--mode", choices=["replay", "follow"], default=os.getenv("RUNNER_MODE", "follow"))
     parser.add_argument("--log-dir", default=os.getenv("LIVE_LOG_DIR", "data/live"))
     parser.add_argument("--poll-seconds", type=float, default=float(os.getenv("POLL_SECONDS", "2")))
@@ -352,10 +382,19 @@ def main() -> None:
     gateway = LiveGateway(log_dir=log_dir)
     gateway.connect()
 
-    if not args.data:
-        raise SystemExit("--data / BAR_CSV_PATH is required")
+    data_path = resolve_bar_csv_path(args.data)
+    if args.mode == "replay" and not args.data.strip():
+        raise SystemExit(_bar_csv_missing_message())
+    if not args.data and not os.getenv("BAR_CSV_PATH", "").strip() and not os.getenv("NT8_EXPORT_PATH", "").strip():
+        logger.warning("BAR_CSV_PATH not set; using default %s", data_path)
 
-    data_path = Path(args.data)
+    legacy_futuresbot = Path(r"C:\TradeData\futuresbot\live\MNQ_1m_live.csv")
+    if data_path == legacy_futuresbot or "futuresbot\\live" in str(data_path).lower():
+        logger.warning(
+            "BAR_CSV_PATH points at deprecated futuresbot live recorder (%s). "
+            "Use NT8 ScalperL2Exporter instead (integrations/ninjatrader8/).",
+            data_path,
+        )
     if args.mode == "replay":
         summary = run_replay(config, data_path, log_dir=log_dir, gateway=gateway)
         print(json.dumps(summary, indent=2))

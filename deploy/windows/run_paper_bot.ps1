@@ -59,8 +59,18 @@ $runnerMode = if ($Mode) { $Mode } else { $env:RUNNER_MODE }
 if (-not $runnerMode) { $runnerMode = "follow" }
 
 $barCsv = if ($DataPath) { $DataPath } else { $env:BAR_CSV_PATH }
+if (-not $barCsv) { $barCsv = $env:NT8_EXPORT_PATH }
 if (-not $barCsv) {
-    Write-Error "BAR_CSV_PATH not set. Point to NinjaTrader L2 aggregated CSV."
+    Write-Error @"
+BAR_CSV_PATH not set. Live L2 must come from NinjaTrader 8 ScalperL2Exporter.
+Set BAR_CSV_PATH (or NT8_EXPORT_PATH) in .env, e.g.:
+  C:\Bots\futures-trend-day-l2-scalper\data\live\nt8_mnq_1m.csv
+See integrations\ninjatrader8\README.md
+"@
+}
+
+if ($barCsv -match 'futuresbot\\live') {
+    Write-Warning "BAR_CSV_PATH uses deprecated futuresbot live recorder. Use NT8 nt8_mnq_1m.csv instead."
 }
 
 $config = $env:SCALPER_CONFIG

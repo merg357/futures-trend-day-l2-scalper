@@ -84,7 +84,7 @@ class LiveGateway:
         return payload
 
     def on_websocket_bar(self, bar: dict[str, Any]) -> None:
-        """Optional real-time bar hook. Stub for future NinjaTrader/Rithmic bridge."""
+        """Optional real-time bar hook. Live bars come from NT8 CSV via paper_runner follow mode."""
         self._audit("websocket_bar_stub", {"keys": sorted(bar.keys())})
 
     def _audit(self, event: str, data: dict[str, Any]) -> None:

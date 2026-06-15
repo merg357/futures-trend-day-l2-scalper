@@ -1,11 +1,21 @@
-﻿You are on a Windows Server 2022 MergMoney trading VPS (RDP: 160.187.32.113:36936, user tradervps). Automate a full paper-only setup for futures-trend-day-l2-scalper. NEVER print or store passwords. NEVER enable live trading.
+﻿You are on a Windows Server 2022 MergMoney trading VPS (RDP: 160.187.32.113:36936, user tradervps). Automate a full PAPER-ONLY setup for futures-trend-day-l2-scalper with NinjaTrader 8 as the live L2 data source. NEVER print or store passwords. NEVER enable live trading.
+
+Live data flow (required):
+  NT8 (Rithmic/sim) → ScalperL2Exporter strategy → CSV → paper_runner follow mode
 
 Goals:
-1) Install Git and Python 3.12 via winget if missing (verify with git --version and py -3.12 --version).
+1) Install Git and Python 3.12 via winget if missing (verify git --version and py -3.12 --version).
 2) Clone https://github.com/merg357/futures-trend-day-l2-scalper.git to C:\Bots\futures-trend-day-l2-scalper (skip clone if folder exists and is a git repo; then git pull).
 3) Set-ExecutionPolicy -Scope Process Bypass -Force for this session.
-4) Create folders: C:\TradeData\futuresbot\live, C:\Bots\futures-trend-day-l2-scalper\data\live, C:\Bots\futures-trend-day-l2-scalper\data\raw.
-5) If .env missing: Copy-Item .env.example .env. Ensure these exact values in .env:
+4) Create folders:
+   C:\Bots\futures-trend-day-l2-scalper\data\live
+   C:\Bots\futures-trend-day-l2-scalper\data\raw
+5) Install NT8 strategy:
+   Copy integrations\ninjatrader8\ScalperL2Exporter.cs to
+   %USERPROFILE%\Documents\NinjaTrader 8\bin\Custom\Strategies\
+   Tell me to open NinjaTrader 8, press F5 to compile, connect Rithmic, open MNQ 1m chart, enable ScalperL2Exporter with ExportPath:
+   C:\Bots\futures-trend-day-l2-scalper\data\live\nt8_mnq_1m.csv
+6) If .env missing: Copy-Item .env.example .env. Ensure these values:
    PAPER_ONLY=true
    LIVE_TRADING=false
    LIVE_TRADING_CONFIRM=
@@ -13,15 +23,17 @@ Goals:
    REPORTS_DIR=data/reports
    LIVE_LOG_DIR=data/live
    SCALPER_CONFIG=configs/production/mnq_walkforward_optimized.yaml
-   BAR_CSV_PATH=C:\TradeData\futuresbot\live\MNQ_1m_live.csv
-   FUTURESBOT_ARCHIVE_ROOT=C:\TradeData\StorageBox\bundles\futuresbot\archives\l2
+   BAR_CSV_PATH=C:\Bots\futures-trend-day-l2-scalper\data\live\nt8_mnq_1m.csv
+   NT8_EXPORT_PATH=C:\Bots\futures-trend-day-l2-scalper\data\live\nt8_mnq_1m.csv
    RUNNER_MODE=follow
    POLL_SECONDS=2
    LOG_LEVEL=INFO
-6) Create venv: py -3.12 -m venv C:\Bots\futures-trend-day-l2-scalper\.venv then pip install -r requirements.txt and run pytest tests -q.
-7) Run: powershell -ExecutionPolicy Bypass -File C:\Bots\futures-trend-day-l2-scalper\deploy\windows\MergMoney_deploy.ps1 -SourceRoot C:\Bots\futures-trend-day-l2-scalper -InstallRoot C:\Bots\futures-trend-day-l2-scalper (do NOT pass -RegisterScheduledTask unless I ask).
-8) Verify BAR_CSV_PATH file exists or warn that NinjaTrader L2 recorder must write C:\TradeData\futuresbot\live\MNQ_1m_live.csv with columns timestamp,open,high,low,close,volume (+ optional L2 columns).
-9) Start paper bot in a new terminal instruction (do not leave blocking forever in agent): powershell -ExecutionPolicy Bypass -File C:\Bots\futures-trend-day-l2-scalper\deploy\windows\run_paper_bot.ps1 -InstallRoot C:\Bots\futures-trend-day-l2-scalper
-10) Report status: tail signals.jsonl and trades.jsonl paths under data\live, and list any errors.
+   Do NOT set BAR_CSV_PATH to C:\TradeData\futuresbot\live\ (deprecated for live follow).
+7) Create venv: py -3.12 -m venv C:\Bots\futures-trend-day-l2-scalper\.venv then pip install -r requirements.txt and pytest tests -q.
+8) Run: powershell -ExecutionPolicy Bypass -File C:\Bots\futures-trend-day-l2-scalper\deploy\windows\MergMoney_deploy.ps1 -SourceRoot C:\Bots\futures-trend-day-l2-scalper -InstallRoot C:\Bots\futures-trend-day-l2-scalper (do NOT pass -RegisterScheduledTask unless I ask).
+9) Verify NT8 CSV: warn if C:\Bots\futures-trend-day-l2-scalper\data\live\nt8_mnq_1m.csv missing — user must enable ScalperL2Exporter in NT8 first. Show expected columns: timestamp,open,high,low,close,volume,bid,ask,bid_size,ask_size,bid_depth,ask_depth,delta
+10) Start paper bot only after NT8 strategy is running (give command, do not block forever):
+    powershell -ExecutionPolicy Bypass -File C:\Bots\futures-trend-day-l2-scalper\deploy\windows\run_paper_bot.ps1 -InstallRoot C:\Bots\futures-trend-day-l2-scalper
+11) Report: tail paths for signals.jsonl and trades.jsonl under data\live, CSV LastWriteTime, any errors.
 
-Constraints: Do not commit .env. Do not set PAPER_ONLY=false or LIVE_TRADING=true. Do not include VPS password in any file.
+Constraints: Do not commit .env. Do not set PAPER_ONLY=false or LIVE_TRADING=true. FUTURESBOT_ARCHIVE_ROOT is historical ETL only.

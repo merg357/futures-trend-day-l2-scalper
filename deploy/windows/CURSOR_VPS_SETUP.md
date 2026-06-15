@@ -1,6 +1,6 @@
-﻿# Cursor + Windows VPS setup (MergMoney) — futures-trend-day-l2-scalper
+﻿# Cursor + Windows VPS setup (MergMoney) — NT8 L2 paper scalper
 
-Complete guide for **Windows Server 2022** trading VPS. Paper mode only by default.
+Complete guide for **Windows Server 2022** trading VPS. **Paper mode only** (`PAPER_ONLY=true`).
 
 | Item | Value |
 |------|--------|
@@ -8,167 +8,123 @@ Complete guide for **Windows Server 2022** trading VPS. Paper mode only by defau
 | RDP host | `160.187.32.113` |
 | RDP port | `36936` |
 | RDP user | `tradervps` |
-| Password | **Enter at login — never store in repo or this file** |
-| Install root (recommended) | `C:\Bots\futures-trend-day-l2-scalper` |
+| Password | **Enter at login — never store in repo** |
+| Install root | `C:\Bots\futures-trend-day-l2-scalper` |
 | GitHub repo | `https://github.com/merg357/futures-trend-day-l2-scalper.git` |
+
+---
+
+## Architecture (NT8-first)
+
+```
+NinjaTrader 8 + Rithmic (or sim)
+  → ScalperL2Exporter strategy (MNQ 1m chart)
+  → OnMarketDepth L1–L5 + OnMarketData (native NT8 L2 stream)
+  → append CSV: C:\Bots\futures-trend-day-l2-scalper\data\live\nt8_mnq_1m.csv
+  → Python paper_runner.py --mode follow (polls BAR_CSV_PATH)
+  → data/live/signals.jsonl, trades.jsonl (paper only)
+```
+
+**Do not** use `C:\TradeData\futuresbot\live\` for live paper follow. That path is deprecated.  
+`FUTURESBOT_ARCHIVE_ROOT` is for **offline historical ETL** only (`scripts/convert_l2_to_bars.py`).
 
 ---
 
 ## 1. Connect to the VPS (RDP)
 
-1. On your PC: `Win+R` → `mstsc` → Enter.
+1. `Win+R` → `mstsc` → Enter.
 2. **Computer:** `160.187.32.113:36936`
-3. **User name:** `tradervps`
-4. Use your VPS password (not committed to git).
-5. Optional: **Show Options** → **Local Resources** → **More** → check a local drive (e.g. `D:`) to copy files via `\\tsclient\D\...`
+3. **User:** `tradervps`
+4. Optional: **Local Resources → More** → enable a local drive for file copy via `\\tsclient\D\...`
 
-**Note:** Port `36936` is RDP, not SSH. Deploy and run everything **inside** the VPS session.
-
----
-
-## 2. Install Cursor on the VPS (if missing)
-
-1. Open **Microsoft Edge** on the VPS.
-2. Download: [https://cursor.com/download](https://cursor.com/download) → **Windows** (x64).
-3. Run the installer (per-user install is fine).
-4. Sign in to Cursor (same account as your dev machine if you want synced settings).
-5. **File → Open Folder** → you will open `C:\Bots\futures-trend-day-l2-scalper` after clone (step 4).
+Port `36936` is RDP, not SSH. Run everything **inside** the VPS session.
 
 ---
 
-## 3. Install Git and Python 3.11+
+## 2. Install Cursor (optional)
 
-Open **PowerShell** (Run as Administrator recommended for winget).
+1. Edge → [cursor.com/download](https://cursor.com/download) → Windows x64.
+2. **File → Open Folder** → `C:\Bots\futures-trend-day-l2-scalper` (after clone).
 
-### 3.1 Git
+---
+
+## 3. Install Git, Python 3.12, NinjaTrader 8
+
+Open **PowerShell** (Administrator recommended):
 
 ```powershell
 winget install --id Git.Git -e --accept-source-agreements --accept-package-agreements
-```
-
-Close and reopen PowerShell, then:
-
-```powershell
-git --version
-```
-
-### 3.2 Python 3.12 (recommended)
-
-```powershell
 winget install --id Python.Python.3.12 -e --accept-source-agreements --accept-package-agreements
-```
-
-Verify:
-
-```powershell
-py -3.12 --version
-py -3.12 -m pip --version
-```
-
-If `py` is missing, use `python --version` after adding Python to PATH during install.
-
-### 3.3 Execution policy (session only — safe)
-
-```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+git --version
+py -3.12 --version
 ```
+
+Install **NinjaTrader 8** from [ninjatrader.com](https://ninjatrader.com/) and configure **Rithmic** (or sim) under **Connections**. Credentials live in NT8 only — not in `.env`.
 
 ---
 
-## 4. Clone from GitHub
+## 4. Clone repo
 
 ```powershell
 New-Item -ItemType Directory -Path C:\Bots -Force | Out-Null
 Set-Location C:\Bots
 git clone https://github.com/merg357/futures-trend-day-l2-scalper.git futures-trend-day-l2-scalper
 Set-Location C:\Bots\futures-trend-day-l2-scalper
-git status
+git pull
 ```
 
 ---
 
-## 5. Directory layout after clone
+## 5. Install ScalperL2Exporter in NinjaTrader 8
 
-```
-C:\Bots\futures-trend-day-l2-scalper\
-├── .env.example          # Template — copy to .env (never commit .env)
-├── .gitignore
-├── pyproject.toml
-├── requirements.txt
-├── README.md
-├── configs\
-│   ├── mnq_default.yaml
-│   ├── mes_default.yaml
-│   └── production\
-│       └── mnq_walkforward_optimized.yaml   # Production paper config
-├── scalper\              # Core library (backtest, paper_runner, safety)
-├── scripts\              # Backtest / optimization CLIs
-├── tests\
-├── deploy\
-│   └── windows\
-│       ├── install.ps1
-│       ├── MergMoney_deploy.ps1
-│       ├── run_paper_bot.ps1
-│       ├── install_scheduled_task.ps1
-│       ├── CURSOR_VPS_SETUP.md
-│       └── CURSOR_AGENT_PROMPT.txt
-└── data\
-    ├── raw\              # Large CSVs gitignored — backtest copies here
-    ├── live\             # Runtime: signals.jsonl, trades.jsonl
-    └── sample\           # Small sample data (if present)
+```powershell
+$nt8 = Join-Path $env:USERPROFILE "Documents\NinjaTrader 8\bin\Custom\Strategies"
+New-Item -ItemType Directory -Path $nt8 -Force | Out-Null
+Copy-Item C:\Bots\futures-trend-day-l2-scalper\integrations\ninjatrader8\ScalperL2Exporter.cs $nt8
 ```
 
-External paths (not in repo):
+In NT8:
 
+1. **New → NinjaScript Editor** → **F5** (Compile).
+2. Open **MNQ** chart → **1 Minute**.
+3. Connect **Rithmic** (green connection).
+4. Chart → **Strategies** → **ScalperL2Exporter** → Enable.
+5. **ExportPath:** `C:\Bots\futures-trend-day-l2-scalper\data\live\nt8_mnq_1m.csv`
+
+Verify CSV grows:
+
+```powershell
+New-Item -ItemType Directory -Force -Path C:\Bots\futures-trend-day-l2-scalper\data\live | Out-Null
+Get-Content C:\Bots\futures-trend-day-l2-scalper\data\live\nt8_mnq_1m.csv -Tail 3 -ErrorAction SilentlyContinue
 ```
-C:\TradeData\futuresbot\live\MNQ_1m_live.csv   # NinjaTrader / futuresbot live bars
-```
+
+Full NT8 steps: `integrations/ninjatrader8/README.md`
 
 ---
 
-## 6. Create `.env` from `.env.example`
+## 6. Create `.env`
 
 ```powershell
 Copy-Item .env.example .env
 notepad .env
 ```
 
-### 6.1 Every environment variable
+### Key variables
 
-| Variable | Example / default | Required | Purpose |
-|----------|-------------------|----------|---------|
-| **PAPER_ONLY** | `true` | Yes | `true` = log signals, block live orders. Only set `false` after validation. |
-| **LIVE_TRADING** | `false` | Yes | Must be `true` for any live gateway path (stub still blocks by default). |
-| **LIVE_TRADING_CONFIRM** | *(empty)* | If live | Must be exactly `I_UNDERSTAND_RISK` when `PAPER_ONLY=false` and `LIVE_TRADING=true`. |
-| **DATA_DIR** | `data` | No | Base data folder name (documentation / scripts). |
-| **REPORTS_DIR** | `data/reports` | No | Backtest report output directory. |
-| **LIVE_LOG_DIR** | `data/live` | Yes | Folder for `signals.jsonl`, `trades.jsonl`, `gateway_audit.jsonl`. |
-| **SCALPER_CONFIG** | `configs/production/mnq_walkforward_optimized.yaml` | Yes | Strategy YAML (relative to repo root). Alias some docs call **CONFIG_PATH** — use **SCALPER_CONFIG** in this project. |
-| **BAR_CSV_PATH** | `C:\TradeData\futuresbot\live\MNQ_1m_live.csv` | Yes | Growing 1m CSV from NinjaTrader L2 recorder (follow mode). |
-| **FUTURESBOT_ARCHIVE_ROOT** | `C:\TradeData\StorageBox\bundles\futuresbot\archives\l2` | No | Offline L2 tarball ETL only (scalper/l2_etl.py). |
-| **RUNNER_MODE** | `follow` | Yes | `follow` = tail live CSV; `replay` = one-shot historical file. |
-| **POLL_SECONDS** | `2` | No | Seconds between CSV polls in follow mode. |
-| **LOG_LEVEL** | `INFO` | No | Python logging: DEBUG, INFO, WARNING, ERROR. |
-| **VPS_SSH_HOST** | `187.124.244.78` | No | **Different host** (Linux Jarvis) — ETL/sync docs only, not this Windows bot. |
-| **VPS_SSH_USER** | `root` | No | Linux VPS SSH user. |
-| **VPS_SSH_IDENTITY_FILE** | `%USERPROFILE%\.ssh\hostinger_vps` | No | SSH key path on workstation. |
-| **RITHMIC_USER** | *(empty)* | No | Leave empty until live gateway implemented. |
-| **RITHMIC_PASSWORD** | *(empty)* | No | Never commit. |
-| **RITHMIC_SYSTEM** | *(empty)* | No | Broker system name. |
-| **NINJATRADER_ACCOUNT** | *(empty)* | No | Account id for future live bridge. |
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PAPER_ONLY` | `true` | Block live orders |
+| `LIVE_TRADING` | `false` | Gateway stub |
+| `BAR_CSV_PATH` | `C:\Bots\futures-trend-day-l2-scalper\data\live\nt8_mnq_1m.csv` | NT8 CSV (follow mode) |
+| `NT8_EXPORT_PATH` | same as above | Alias; used if `BAR_CSV_PATH` empty |
+| `SCALPER_CONFIG` | `configs/production/mnq_walkforward_optimized.yaml` | Strategy YAML |
+| `LIVE_LOG_DIR` | `data/live` | signals.jsonl, trades.jsonl |
+| `RUNNER_MODE` | `follow` | Tail NT8 CSV |
+| `POLL_SECONDS` | `2` | CSV poll interval |
+| `FUTURESBOT_ARCHIVE_ROOT` | *(optional)* | **Historical ETL only** — not live feed |
 
-### 6.2 Derived log paths (not separate env vars)
-
-The runner writes under `LIVE_LOG_DIR`:
-
-| File | Env alias (informal) | Path |
-|------|----------------------|------|
-| Entry signals | SIGNAL_LOG_PATH | `{LIVE_LOG_DIR}/signals.jsonl` |
-| Paper trades | TRADE_LOG_PATH | `{LIVE_LOG_DIR}/trades.jsonl` |
-| Gateway audit | — | `{LIVE_LOG_DIR}/gateway_audit.jsonl` |
-| Replay events | — | `{LIVE_LOG_DIR}/runner_events.jsonl` |
-
-### 6.3 Recommended MergMoney `.env` (paper)
+Recommended paper `.env`:
 
 ```ini
 PAPER_ONLY=true
@@ -179,8 +135,8 @@ DATA_DIR=data
 REPORTS_DIR=data/reports
 LIVE_LOG_DIR=data/live
 SCALPER_CONFIG=configs/production/mnq_walkforward_optimized.yaml
-BAR_CSV_PATH=C:\TradeData\futuresbot\live\MNQ_1m_live.csv
-FUTURESBOT_ARCHIVE_ROOT=C:\TradeData\StorageBox\bundles\futuresbot\archives\l2
+BAR_CSV_PATH=C:\Bots\futures-trend-day-l2-scalper\data\live\nt8_mnq_1m.csv
+NT8_EXPORT_PATH=C:\Bots\futures-trend-day-l2-scalper\data\live\nt8_mnq_1m.csv
 
 RUNNER_MODE=follow
 POLL_SECONDS=2
@@ -189,11 +145,10 @@ LOG_LEVEL=INFO
 
 ---
 
-## 7. Python virtual environment and dependencies
-
-From repo root `C:\Bots\futures-trend-day-l2-scalper`:
+## 7. Python venv
 
 ```powershell
+Set-Location C:\Bots\futures-trend-day-l2-scalper
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
@@ -202,154 +157,89 @@ python -c "import scalper; print('scalper ok')"
 python -m pytest tests -q
 ```
 
----
-
-## 8. Create required folders
+Or automated:
 
 ```powershell
-New-Item -ItemType Directory -Force -Path 
-  "C:\TradeData\futuresbot\live", 
-  "C:\Bots\futures-trend-day-l2-scalper\data\live", 
-  "C:\Bots\futures-trend-day-l2-scalper\data\raw" | Out-Null
-```
-
-Or use automated install:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\deploy\windows\MergMoney_deploy.ps1 
-  -SourceRoot "C:\Bots\futures-trend-day-l2-scalper" 
+powershell -ExecutionPolicy Bypass -File .\deploy\windows\MergMoney_deploy.ps1 `
+  -SourceRoot "C:\Bots\futures-trend-day-l2-scalper" `
   -InstallRoot "C:\Bots\futures-trend-day-l2-scalper"
 ```
 
 ---
 
-## 9. NinjaTrader 8 + Rithmic + CSV export
+## 8. Start order (important)
 
-1. Install **NinjaTrader 8** on the VPS.
-2. **Connections** → configure **Rithmic** (credentials in NinjaTrader only — not in `.env` for paper follow).
-3. Open an **MNQ** chart (1-minute) with your data feed connected during RTH.
-4. Run your **futuresbot L2 recorder** (or NT strategy) that appends aggregated 1m rows to:
-
-   `C:\TradeData\futuresbot\live\MNQ_1m_live.csv`
-
-5. **CSV columns (must match backtester):**
-
-   - Required: `timestamp`, `open`, `high`, `low`, `close`, `volume`
-   - Optional L2: `bid`, `ask`, `bid_size`, `ask_size`, `bid_depth`, `ask_depth`, `delta`
-
-6. Timestamps: use **US/Eastern** session consistency with your backtest CSVs.
-7. Before starting the bot:
-
-   ```powershell
-   Get-Item C:\TradeData\futuresbot\live\MNQ_1m_live.csv | Select-Object Length, LastWriteTime
-   Get-Content C:\TradeData\futuresbot\live\MNQ_1m_live.csv -Tail 3
-   ```
-
----
-
-## 10. Run paper bot (exact PowerShell)
+1. **NinjaTrader 8** connected to Rithmic/sim.
+2. **ScalperL2Exporter** enabled on MNQ 1m chart.
+3. Confirm `nt8_mnq_1m.csv` has recent rows.
+4. **Then** start Python paper runner:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass -Force
 Set-Location C:\Bots\futures-trend-day-l2-scalper
-powershell -ExecutionPolicy Bypass -File .\deploy\windows\run_paper_bot.ps1 
+powershell -ExecutionPolicy Bypass -File .\deploy\windows\run_paper_bot.ps1 `
   -InstallRoot "C:\Bots\futures-trend-day-l2-scalper"
 ```
 
-Expected output includes:
+Expected:
 
 - `Paper mode active (PAPER_ONLY=true, LIVE_TRADING=false)`
-- `Starting paper runner: mode=follow`
-- `Following C:\TradeData\futuresbot\live\MNQ_1m_live.csv`
+- `Following C:\Bots\futures-trend-day-l2-scalper\data\live\nt8_mnq_1m.csv`
 
 Stop with **Ctrl+C**.
 
-### Replay mode (offline test)
+### Replay (offline, no NT8)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\deploy\windows\run_paper_bot.ps1 
-  -InstallRoot "C:\Bots\futures-trend-day-l2-scalper" 
-  -Mode replay 
+powershell -ExecutionPolicy Bypass -File .\deploy\windows\run_paper_bot.ps1 `
+  -InstallRoot "C:\Bots\futures-trend-day-l2-scalper" `
+  -Mode replay `
   -DataPath "C:\Bots\futures-trend-day-l2-scalper\data\raw\YOUR_FILE.csv"
 ```
 
 ---
 
-## 11. Optional: Windows Scheduled Task
-
-After manual validation:
+## 9. Verify
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\Bots\futures-trend-day-l2-scalper\deploy\windows\install_scheduled_task.ps1 
+Get-Content C:\Bots\futures-trend-day-l2-scalper\data\live\signals.jsonl -Tail 5
+Get-Content C:\Bots\futures-trend-day-l2-scalper\data\live\trades.jsonl -Tail 5
+Get-Item C:\Bots\futures-trend-day-l2-scalper\data\live\nt8_mnq_1m.csv | Select-Object Length, LastWriteTime
+```
+
+---
+
+## 10. Optional scheduled task
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\windows\install_scheduled_task.ps1 `
   -InstallRoot "C:\Bots\futures-trend-day-l2-scalper"
 ```
 
-Or during deploy:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\deploy\windows\MergMoney_deploy.ps1 
-  -SourceRoot "C:\Bots\futures-trend-day-l2-scalper" 
-  -InstallRoot "C:\Bots\futures-trend-day-l2-scalper" 
-  -RegisterScheduledTask
-```
-
-Task name: **MNQ-Paper-Scalper** (daily ~09:25). Stop task at session end if needed.
+Start NT8 + strategy **before** the task fires (~09:25).
 
 ---
 
-## 12. Verify the bot is working
+## Troubleshooting
 
-1. **Console:** no repeated `Bar file missing` after CSV exists; `Following ...` line present.
-2. **Signals log:**
-
-   ```powershell
-   Get-Content C:\Bots\futures-trend-day-l2-scalper\data\live\signals.jsonl -Tail 5
-   ```
-
-   Each line is JSON with `side`, `trend_score`, `l2_score`, `paper_only: true`.
-
-3. **Trades log** (after exits):
-
-   ```powershell
-   Get-Content C:\Bots\futures-trend-day-l2-scalper\data\live\trades.jsonl -Tail 5
-   ```
-
-4. **Gateway audit** (should show blocked/paper behavior):
-
-   ```powershell
-   Get-Content C:\Bots\futures-trend-day-l2-scalper\data\live\gateway_audit.jsonl -Tail 5
-   ```
-
-5. **CSV still growing** during session (`LastWriteTime` updates).
+| Symptom | Fix |
+|---------|-----|
+| `Bar file missing` | Enable ScalperL2Exporter; Rithmic connected; paths match |
+| Deprecated futuresbot warning | Update `.env` to `nt8_mnq_1m.csv` |
+| NT8 compile error | File in `Custom\Strategies\`; F5 rebuild |
+| No signals | Normal in chop; check `signals.jsonl` during RTH |
+| `Could not read bars` | Fix CSV header; no partial rows |
 
 ---
 
-## 13. Troubleshooting
+## 11. Cursor Agent one-shot
 
-| Symptom | Likely cause | Fix |
-|---------|----------------|-----|
-| `Python venv missing` | No `.venv` | Run `install.ps1` or section 7 |
-| `cannot be loaded because running scripts is disabled` | Execution policy | `Set-ExecutionPolicy -Scope Process Bypass` |
-| `BAR_CSV_PATH not set` | Missing `.env` | Copy `.env.example` → `.env` |
-| `Bar file missing` | NT recorder not running | Start recorder; create folder `C:\TradeData\futuresbot\live` |
-| `Could not read bars` | Bad CSV format | Fix headers; ensure UTF-8 CSV, no partial rows |
-| No new signals | Low activity / chop filters | Normal; check `LOG_LEVEL=DEBUG` temporarily |
-| `py` not found | Python not on PATH | Reinstall Python; check "Add to PATH" |
-| Wrong config path | `SCALPER_CONFIG` typo | Use `configs/production/mnq_walkforward_optimized.yaml` |
-| Empty `signals.jsonl` | No entries yet | Wait for strategy conditions during RTH |
-
----
-
-## 14. One-shot Cursor Agent prompt
-
-Paste the contents of `deploy/windows/CURSOR_AGENT_PROMPT.txt` into **Cursor Agent** on the VPS to automate steps 3–10.
+Paste `deploy/windows/CURSOR_AGENT_PROMPT.txt` into Cursor Agent on the VPS.
 
 ---
 
 ## Security
 
-- Rotate VPS password if shared in chat.
-- Never commit `.env`, passwords, or API keys.
+- Never commit `.env` or Rithmic passwords.
 - Keep `PAPER_ONLY=true` until paper logs match backtests.
-- Linux VPS `187.124.244.78` is a **separate** Jarvis host — not used to run this Windows scalper.
-
+- Linux VPS `187.124.244.78` is a separate Jarvis host — not this Windows bot.
