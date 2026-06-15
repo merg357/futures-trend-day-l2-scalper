@@ -1,0 +1,73 @@
+symbol: MES
+instrument_family: ES
+tick_size: 0.25
+tick_value: 1.25
+point_value: 5.0
+contract_multiplier: 5.0
+session:
+  timezone: America/New_York
+  rth_open: 09:30
+  rth_close: '16:00'
+  flatten_before_close_minutes: 5
+trend:
+  ema_fast: 9
+  ema_slow: 21
+  ema_trend: 50
+  vwap_enabled: true
+  adx_period: 14
+  adx_trend_min: 22.0
+  atr_period: 14
+  atr_expansion_mult: 1.1
+  min_trend_score: 58.0
+  weight_ema: 25.0
+  weight_vwap: 20.0
+  weight_adx: 25.0
+  weight_atr: 15.0
+  weight_structure: 15.0
+l2:
+  min_l2_score: 52.0
+  imbalance_threshold: 0.55
+  depth_levels: 5
+  min_book_depth: 50.0
+  spoof_filter_enabled: true
+  weight_imbalance: 35.0
+  weight_depth: 25.0
+  weight_delta: 25.0
+  weight_absorption: 15.0
+  approximation_when_missing: true
+entry:
+  chop_filter_enabled: true
+  chop_adx_max: 18.0
+  chop_range_atr_mult: 0.8
+  pullback_to_ema_ticks: 3
+  max_spread_ticks: 4
+  require_l2_confirmation: true
+  min_bars_after_open: 5
+  cooldown_bars_after_exit: 3
+exit:
+  stop_loss_ticks: 7
+  take_profit_ticks: 28
+  breakeven_enabled: true
+  breakeven_trigger_ticks: 9
+  breakeven_offset_ticks: 1
+  trailing_enabled: true
+  trailing_trigger_ticks: 18
+  trailing_offset_ticks: 4
+  max_hold_bars: 53
+  l2_reversal_exit_enabled: true
+  l2_reversal_threshold: 35.0
+  exit_at_session_end: true
+risk:
+  max_contracts: 1
+  max_trades_per_session: 8
+  max_daily_loss_dollars: 250.0
+  risk_per_trade_dollars: 40.0
+  max_consecutive_losses: 3
+backtest:
+  slippage_ticks: 1
+  commission_per_side: 0.62
+  initial_capital: 10000.0
+optimize:
+  n_trials_default: 50
+  metric: net_pnl
+  min_trades: 3

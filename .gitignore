@@ -1,0 +1,47 @@
+﻿# Environment and secrets
+.env
+.env.local
+.env.*.local
+*credentials*
+*.pem
+*.key
+id_rsa*
+known_hosts
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+ENV/
+
+# Logs
+*.log
+logs/
+
+# Large / generated data
+data/raw/**
+!data/raw/.gitkeep
+!data/raw/etl_manifest.json
+data/reports/
+data/processed/
+data/live/**
+!data/live/.gitkeep
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Archives
+*.tar.gz
+*.zip

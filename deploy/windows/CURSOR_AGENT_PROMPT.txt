@@ -1,0 +1,27 @@
+﻿You are on a Windows Server 2022 MergMoney trading VPS (RDP: 160.187.32.113:36936, user tradervps). Automate a full paper-only setup for futures-trend-day-l2-scalper. NEVER print or store passwords. NEVER enable live trading.
+
+Goals:
+1) Install Git and Python 3.12 via winget if missing (verify with git --version and py -3.12 --version).
+2) Clone https://github.com/merg357/futures-trend-day-l2-scalper.git to C:\Bots\futures-trend-day-l2-scalper (skip clone if folder exists and is a git repo; then git pull).
+3) Set-ExecutionPolicy -Scope Process Bypass -Force for this session.
+4) Create folders: C:\TradeData\futuresbot\live, C:\Bots\futures-trend-day-l2-scalper\data\live, C:\Bots\futures-trend-day-l2-scalper\data\raw.
+5) If .env missing: Copy-Item .env.example .env. Ensure these exact values in .env:
+   PAPER_ONLY=true
+   LIVE_TRADING=false
+   LIVE_TRADING_CONFIRM=
+   DATA_DIR=data
+   REPORTS_DIR=data/reports
+   LIVE_LOG_DIR=data/live
+   SCALPER_CONFIG=configs/production/mnq_walkforward_optimized.yaml
+   BAR_CSV_PATH=C:\TradeData\futuresbot\live\MNQ_1m_live.csv
+   FUTURESBOT_ARCHIVE_ROOT=C:\TradeData\StorageBox\bundles\futuresbot\archives\l2
+   RUNNER_MODE=follow
+   POLL_SECONDS=2
+   LOG_LEVEL=INFO
+6) Create venv: py -3.12 -m venv C:\Bots\futures-trend-day-l2-scalper\.venv then pip install -r requirements.txt and run pytest tests -q.
+7) Run: powershell -ExecutionPolicy Bypass -File C:\Bots\futures-trend-day-l2-scalper\deploy\windows\MergMoney_deploy.ps1 -SourceRoot C:\Bots\futures-trend-day-l2-scalper -InstallRoot C:\Bots\futures-trend-day-l2-scalper (do NOT pass -RegisterScheduledTask unless I ask).
+8) Verify BAR_CSV_PATH file exists or warn that NinjaTrader L2 recorder must write C:\TradeData\futuresbot\live\MNQ_1m_live.csv with columns timestamp,open,high,low,close,volume (+ optional L2 columns).
+9) Start paper bot in a new terminal instruction (do not leave blocking forever in agent): powershell -ExecutionPolicy Bypass -File C:\Bots\futures-trend-day-l2-scalper\deploy\windows\run_paper_bot.ps1 -InstallRoot C:\Bots\futures-trend-day-l2-scalper
+10) Report status: tail signals.jsonl and trades.jsonl paths under data\live, and list any errors.
+
+Constraints: Do not commit .env. Do not set PAPER_ONLY=false or LIVE_TRADING=true. Do not include VPS password in any file.
