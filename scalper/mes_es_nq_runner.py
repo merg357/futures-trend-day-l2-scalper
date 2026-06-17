@@ -102,7 +102,14 @@ def _apply_mes_env(config) -> None:
     os.environ["MES_STOP_LOSS_TICKS"] = str(config.exit.stop_loss_ticks)
 
 
-def _write_runner_status(config, *, log_dir: Path, data_path: Path, mode: str) -> None:
+def _write_runner_status(
+    config,
+    *,
+    log_dir: Path,
+    data_path: Path,
+    mode: str,
+    poll_seconds: float | None = None,
+) -> None:
     payload = {
         "strategy_mode": config.mode,
         "runner": "mes_es_nq_runner",
@@ -116,6 +123,14 @@ def _write_runner_status(config, *, log_dir: Path, data_path: Path, mode: str) -
         "paper_only": paper_only_mode(),
         "nt8_demo_orders": demo_nt8_orders_enabled(),
         "order_id_prefix": config.mes_execution.order_id_prefix,
+        "poll_seconds": float(
+            poll_seconds
+            if poll_seconds is not None
+            else os.getenv("MES_POLL_SECONDS", os.getenv("MES_DECISION_LOOP_SEC", "0.25"))
+        ),
+        "entry_timeout_ms": config.mes_execution.entry_timeout_ms,
+        "entry_order_mode": config.mes_execution.entry_order_mode,
+        "block_on_fill_divergence": config.mes_execution.block_on_fill_divergence,
     }
     try:
         STATE_STATUS.parent.mkdir(parents=True, exist_ok=True)
@@ -133,7 +148,7 @@ def main() -> None:
     parser.add_argument("--mode", choices=["replay", "follow"], default=os.getenv("RUNNER_MODE", "follow"))
     parser.add_argument("--log-dir", default=os.getenv("LIVE_LOG_DIR", "data/live_mes_es_nq"))
     parser.add_argument("--poll-seconds", type=float, default=float(
-        os.getenv("POLL_SECONDS", os.getenv("MES_DECISION_LOOP_SEC", "0.25"))
+        os.getenv("MES_POLL_SECONDS", os.getenv("MES_DECISION_LOOP_SEC", "0.25"))
     ))
     args = parser.parse_args()
 
@@ -168,7 +183,9 @@ def main() -> None:
     if args.mode == "replay" and not args.data.strip():
         raise SystemExit(_bar_csv_missing_message())
 
-    _write_runner_status(config, log_dir=log_dir, data_path=data_path, mode=args.mode)
+    _write_runner_status(
+        config, log_dir=log_dir, data_path=data_path, mode=args.mode, poll_seconds=args.poll_seconds,
+    )
 
     logger.info(
         "MES/ES/NQ raw test: exec=%s signal=%s confirm=%s orders=%s only",

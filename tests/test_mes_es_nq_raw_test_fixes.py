@@ -87,6 +87,31 @@ def test_entry_order_mode_default_marketable_limit(mes_config) -> None:
     assert mes_config.mes_execution.entry_order_mode == "MARKETABLE_LIMIT"
 
 
+def test_entry_cancel_timeout_fires_before_poll_throttle(mes_config, monkeypatch) -> None:
+    """Timeout cancel must not wait for orderflow/fast-monitor throttle."""
+    from unittest.mock import MagicMock
+    import time
+
+    from scalper.models import Side
+    from scalper.paper_runner import PendingEntry, RunnerState, _maybe_cancel_pending_entry_timeout
+
+    gateway = MagicMock()
+    gateway.cancel_order.return_value = {"status": "cancelled"}
+    state = RunnerState(
+        pending_entry=PendingEntry(
+            order_id="L2MES_ENT_test",
+            submit_ts=time.monotonic() - 2.0,
+            side=Side.LONG,
+            limit_price=5000.0,
+            quantity=1,
+        ),
+        last_fast_monitor_ts=time.monotonic(),
+    )
+    _maybe_cancel_pending_entry_timeout(state, mes_config, gateway)
+    gateway.cancel_order.assert_called_once_with("L2MES_ENT_test", reason="cancel_timeout")
+    assert state.pending_entry is None
+
+
 def test_adverse_mid_cancel_ticks_12(mes_config) -> None:
     assert mes_config.entry.entry_adverse_mid_ticks == 12
     assert mes_config.entry.use_adverse_mid_cancel is True

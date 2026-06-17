@@ -69,6 +69,7 @@ class RunnerState:
     last_flow_exit_poll_ts: float = 0.0
     last_orderflow_poll_ts: float = 0.0
     last_fast_monitor_ts: float = 0.0
+    last_pending_fill_poll_ts: float = 0.0
     last_entry_submit_ts: float = 0.0
     last_flow_burst_entry_ts: float = 0.0
     flow_burst_entry_minute: str | None = None
@@ -263,6 +264,13 @@ def _decision_poll_sec(config: ScalperConfig, poll_seconds: float) -> float:
     if config.is_mes_es_nq_mode():
         return max(0.05, config.raw_test_runtime.decision_loop_ms / 1000.0)
     return poll_seconds
+
+
+def _entry_cancel_timeout_sec(config: ScalperConfig) -> float:
+    """MES raw test uses mes_execution.entry_timeout_ms; MNQ uses entry_cancel_timeout_sec."""
+    if config.is_mes_es_nq_mode() and config.mes_execution.entry_timeout_ms > 0:
+        return config.mes_execution.entry_timeout_ms / 1000.0
+    return float(config.entry.entry_cancel_timeout_sec or 45)
 
 
 def _fill_bucket_from_ms(elapsed_ms: float) -> str:
@@ -758,9 +766,10 @@ def _execute_entry(
             order_type = str(result.get("order_type") or "MARKET").upper()
             order_id = str(result.get("order_id") or "")
             if order_type == "LIMIT" and order_id:
+                working_ts = time.monotonic()
                 state.pending_entry = PendingEntry(
                     order_id=order_id,
-                    submit_ts=submit_ts,
+                    submit_ts=working_ts,
                     side=signal.side,
                     limit_price=fill,
                     quantity=qty,
@@ -800,6 +809,10 @@ def _maybe_poll_pending_entry_fill(
     pending = state.pending_entry
     if pending is None or state.position is not None or gateway is None:
         return
+    now = time.monotonic()
+    if now - state.last_pending_fill_poll_ts < _fast_poll_sec(config):
+        return
+    state.last_pending_fill_poll_ts = now
     nt8_pos = gateway.query_market_position()
     if _nt8_position_matches_entry(nt8_pos, pending.side, pending.quantity):
         ts = row["timestamp"]
@@ -824,6 +837,35 @@ def _maybe_poll_pending_entry_fill(
         logger.info("Pending LIMIT filled — position synced side=%s", state.position.side.value)
 
 
+def _maybe_cancel_pending_entry_timeout(
+    state: RunnerState,
+    config: ScalperConfig,
+    gateway: LiveGateway | None,
+    *,
+    log_dir: Path | None = None,
+) -> None:
+    """Fast timeout cancel — runs before any slow NT8/file work in the follow loop."""
+    pending = state.pending_entry
+    if pending is None or state.position is not None or gateway is None:
+        return
+    elapsed = time.monotonic() - pending.submit_ts
+    timeout = _entry_cancel_timeout_sec(config)
+    if elapsed < timeout:
+        return
+    gateway.cancel_order(pending.order_id, reason="cancel_timeout")
+    if log_dir and config.is_mes_es_nq_mode():
+        _log_entry_event(log_dir, {
+            "event": "entry_cancelled",
+            "cancel_reason": "cancel_timeout",
+            "fill_bucket": "cancel_timeout",
+            "order_id": pending.order_id,
+            "time_submit_to_cancel_ms": round(elapsed * 1000.0, 1),
+            "entry_limit_price": pending.limit_price,
+        })
+    state.pending_entry = None
+    logger.info("Cancelled pending LIMIT (timeout %.0fms) id=%s", timeout * 1000, pending.order_id)
+
+
 def _maybe_poll_adverse_entry_cancel(
     row: pd.Series,
     state: RunnerState,
@@ -832,37 +874,19 @@ def _maybe_poll_adverse_entry_cancel(
     *,
     log_dir: Path | None = None,
 ) -> None:
-    """Cancel working entry LIMIT on timeout or adverse MES mid move."""
+    """Cancel working entry LIMIT on adverse MES mid move (timeout handled separately)."""
     pending = state.pending_entry
     if pending is None or state.position is not None or gateway is None:
+        return
+
+    if not config.entry.use_adverse_mid_cancel:
         return
 
     now = time.monotonic()
     if now - state.last_fast_monitor_ts < _fast_poll_sec(config):
         return
     state.last_fast_monitor_ts = now
-
     elapsed = now - pending.submit_ts
-    timeout = float(config.entry.entry_cancel_timeout_sec or 45)
-    if config.is_mes_es_nq_mode() and config.mes_execution.entry_timeout_ms > 0:
-        timeout = config.mes_execution.entry_timeout_ms / 1000.0
-    if elapsed >= timeout:
-        gateway.cancel_order(pending.order_id, reason="cancel_timeout")
-        if log_dir and config.is_mes_es_nq_mode():
-            _log_entry_event(log_dir, {
-                "event": "entry_cancelled",
-                "cancel_reason": "cancel_timeout",
-                "fill_bucket": "cancel_timeout",
-                "order_id": pending.order_id,
-                "time_submit_to_cancel_ms": round(elapsed * 1000.0, 1),
-                "entry_limit_price": pending.limit_price,
-            })
-        state.pending_entry = None
-        logger.info("Cancelled pending LIMIT (timeout %.0fms) id=%s", timeout * 1000, pending.order_id)
-        return
-
-    if not config.entry.use_adverse_mid_cancel:
-        return
 
     mes_quote = _read_mes_quote(config) if config.is_mes_es_nq_mode() else {}
     mid = float(mes_quote.get("mid") or 0)
@@ -1279,6 +1303,8 @@ def run_follow(
     )
 
     while True:
+        _maybe_cancel_pending_entry_timeout(state, config, gateway, log_dir=log_dir)
+
         if not data_path.exists():
             logger.warning(
                 "Bar file missing: %s â€” enable ScalperL2Exporter in NT8 (see integrations/ninjatrader8/README.md)",
@@ -1353,8 +1379,8 @@ def run_follow(
             prev_row = df.iloc[-2]
             state.bar_index = len(df) - 1
             _sync_minute_state(state, last_row, config)
-            _maybe_poll_pending_entry_fill(last_row, state, config, gateway, log_dir=log_dir)
             _maybe_poll_adverse_entry_cancel(last_row, state, config, gateway, log_dir=log_dir)
+            _maybe_poll_pending_entry_fill(last_row, state, config, gateway, log_dir=log_dir)
             _maybe_poll_flow_exit(
                 last_row, state, config, risk,
                 mode="follow",
@@ -1372,7 +1398,16 @@ def run_follow(
                 log_dir=log_dir,
             )
 
-        time.sleep(loop_sec)
+        if state.pending_entry is not None:
+            deadline = time.monotonic() + loop_sec
+            while state.pending_entry is not None and time.monotonic() < deadline:
+                _maybe_cancel_pending_entry_timeout(state, config, gateway, log_dir=log_dir)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or state.pending_entry is None:
+                    break
+                time.sleep(min(_fast_poll_sec(config), remaining))
+        else:
+            time.sleep(loop_sec)
 
 
 def _enforce_runner_safety() -> None:

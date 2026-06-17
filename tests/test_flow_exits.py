@@ -18,7 +18,7 @@ from scalper.exit_rules import (
     init_position,
 )
 from scalper.models import ExitReason, Side
-from scalper.paper_runner import PendingEntry, RunnerState, _maybe_poll_adverse_entry_cancel
+from scalper.paper_runner import PendingEntry, RunnerState, _maybe_cancel_pending_entry_timeout
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -150,6 +150,6 @@ def test_adverse_cancel_timeout(monkeypatch, tmp_path) -> None:
         of_path,
     )
 
-    _maybe_poll_adverse_entry_cancel(row, state, cfg, gateway)
+    _maybe_cancel_pending_entry_timeout(state, cfg, gateway)
     gateway.cancel_order.assert_called_once()
     assert state.pending_entry is None
