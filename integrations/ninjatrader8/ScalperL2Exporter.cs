@@ -32,6 +32,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private bool headerWritten;
 		private string resolvedExportPath = string.Empty;
 
+		// Tick-built 1m bars when chart OnBarClose stalls after reconnect.
+		private DateTime aggBarMinute = DateTime.MinValue;
+		private double aggOpen;
+		private double aggHigh;
+		private double aggLow;
+		private double aggClose;
+		private long aggVolume;
+		private double aggBarDelta;
+		private DateTime lastExportedMinute = DateTime.MinValue;
+
 		[NinjaScriptProperty]
 		[Display(Name = "ExportPath", Order = 1, GroupName = "Parameters",
 			Description = "Append-only CSV path (match BAR_CSV_PATH / NT8_EXPORT_PATH in Python .env)")]
@@ -48,7 +58,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			{
 				Name = "ScalperL2Exporter";
 				Description = "Append 1m OHLCV + L2 book to CSV for futures-trend-day-l2-scalper paper_runner";
-				Calculate = Calculate.OnBarClose;
+				Calculate = Calculate.OnEachTick;
 				EntriesPerDirection = 1;
 				EntryHandling = EntryHandling.AllEntries;
 				IsExitOnSessionCloseStrategy = false;
@@ -97,37 +107,24 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (CurrentBar < BarsRequiredToTrade)
 				return;
 
-			// Only export completed 1-minute bars (OnBarClose).
-			if (IsFirstTickOfBar)
+			if (State != State.Realtime)
+				return;
+
+			// Chart bar path (backup when tick agg already exported this minute).
+			if (IsFirstTickOfBar && CurrentBar > 0)
+			{
+				DateTime closedMinute = Time[1];
+				if (closedMinute > lastExportedMinute)
+				{
+					ExportCsvRow(
+						closedMinute,
+						Open[1], High[1], Low[1], Close[1],
+						(long)Volume[1],
+						barDelta);
+					lastExportedMinute = closedMinute;
+				}
 				barDelta = 0;
-
-			double bid = lastBid > 0 ? lastBid : GetCurrentBid();
-			double ask = lastAsk > 0 ? lastAsk : GetCurrentAsk();
-			long bidSize = lastBidSize > 0 ? lastBidSize : (long)Math.Max(0, bidSizes[0]);
-			long askSize = lastAskSize > 0 ? lastAskSize : (long)Math.Max(0, askSizes[0]);
-
-			long bidDepth = SumSizes(bidSizes);
-			long askDepth = SumSizes(askSizes);
-
-			string timestamp = Time[0].ToString("yyyy-MM-dd HH:mm:ss");
-			string line = string.Format(
-				System.Globalization.CultureInfo.InvariantCulture,
-				"{0},{1:0.00},{2:0.00},{3:0.00},{4:0.00},{5},{6:0.00},{7:0.00},{8},{9},{10},{11},{12:0.0}",
-				timestamp,
-				Open[0],
-				High[0],
-				Low[0],
-				Close[0],
-				(long)Volume[0],
-				bid,
-				ask,
-				bidSize,
-				askSize,
-				bidDepth,
-				askDepth,
-				barDelta);
-
-			AppendCsvLine(line);
+			}
 		}
 
 		protected override void OnMarketDepth(MarketDepthEventArgs e)
@@ -189,9 +186,84 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 			// Classify aggressor vs top of book for bar delta.
 			if (ask > 0 && e.Price >= ask - TickSize * 0.5)
+			{
 				barDelta += size;
+				aggBarDelta += size;
+			}
 			else if (bid > 0 && e.Price <= bid + TickSize * 0.5)
+			{
 				barDelta -= size;
+				aggBarDelta -= size;
+			}
+
+			if (State != State.Realtime)
+				return;
+
+			DateTime barMinute = FloorToMinute(e.Time);
+			if (aggBarMinute == DateTime.MinValue)
+			{
+				aggBarMinute = barMinute;
+				InitAggBar(e.Price, size);
+				return;
+			}
+
+			if (barMinute > aggBarMinute)
+			{
+				if (aggBarMinute > lastExportedMinute)
+				{
+					ExportCsvRow(
+						aggBarMinute,
+						aggOpen, aggHigh, aggLow, aggClose,
+						aggVolume,
+						aggBarDelta);
+					lastExportedMinute = aggBarMinute;
+				}
+				aggBarMinute = barMinute;
+				InitAggBar(e.Price, size);
+				aggBarDelta = 0;
+			}
+			else if (barMinute == aggBarMinute)
+			{
+				UpdateAggBar(e.Price, size);
+			}
+		}
+
+		private static DateTime FloorToMinute(DateTime t)
+		{
+			return new DateTime(t.Year, t.Month, t.Day, t.Hour, t.Minute, 0);
+		}
+
+		private void InitAggBar(double price, long size)
+		{
+			aggOpen = aggHigh = aggLow = aggClose = price;
+			aggVolume = size;
+		}
+
+		private void UpdateAggBar(double price, long size)
+		{
+			aggClose = price;
+			if (price > aggHigh)
+				aggHigh = price;
+			if (price < aggLow)
+				aggLow = price;
+			aggVolume += size;
+		}
+
+		private void ExportCsvRow(DateTime minute, double o, double h, double l, double c, long vol, double delta)
+		{
+			double bid = lastBid > 0 ? lastBid : GetCurrentBid();
+			double ask = lastAsk > 0 ? lastAsk : GetCurrentAsk();
+			long bidSize = lastBidSize > 0 ? lastBidSize : (long)Math.Max(0, bidSizes[0]);
+			long askSize = lastAskSize > 0 ? lastAskSize : (long)Math.Max(0, askSizes[0]);
+			long bidDepth = SumSizes(bidSizes);
+			long askDepth = SumSizes(askSizes);
+
+			string timestamp = minute.ToString("yyyy-MM-dd HH:mm:ss");
+			string line = string.Format(
+				System.Globalization.CultureInfo.InvariantCulture,
+				"{0},{1:0.00},{2:0.00},{3:0.00},{4:0.00},{5},{6:0.00},{7:0.00},{8},{9},{10},{11},{12:0.0}",
+				timestamp, o, h, l, c, vol, bid, ask, bidSize, askSize, bidDepth, askDepth, delta);
+			AppendCsvLine(line);
 		}
 
 		private void AppendCsvLine(string line)

@@ -1,4 +1,4 @@
-"""Paper/replay runner — evaluates signals from CSV bars, never sends live orders."""
+﻿"""Paper/replay runner â€” evaluates signals from CSV bars, never sends live orders."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,13 +17,14 @@ import pandas as pd
 
 from scalper.backtest import _apply_slippage, _calc_pnl, load_bars
 from scalper.config import ScalperConfig, load_config
-from scalper.entry_rules import evaluate_entry
+from scalper.entry_rules import evaluate_entry, evaluate_flow_burst_entry
 from scalper.exit_rules import evaluate_exit, init_position
+from scalper.flow_signals import build_intrabar_snapshot_row, enrich_bar_from_orderflow
 from scalper.indicators import compute_indicators
-from scalper.live_gateway import LiveGateway, OrderAction, OrderRequest
+from scalper.live_gateway import LiveGateway, OrderAction, OrderRequest, is_entry_blocked
 from scalper.models import ExitReason, Position, Side, Trade
 from scalper.risk import RiskManager
-from scalper.trading_safety import live_trading_enabled, paper_only_mode
+from scalper.trading_safety import demo_nt8_orders_enabled, live_trading_enabled, paper_only_mode
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,14 @@ class RunnerState:
     entry_l2: float = 0.0
     bar_index: int = 0
     processed_timestamps: set[str] | None = None
+    # Intrabar flow burst (L2/DOM + MBO counters via orderflow.json).
+    last_flow_burst_poll_ts: float = 0.0
+    last_orderflow_poll_ts: float = 0.0
+    last_flow_burst_entry_ts: float = 0.0
+    flow_burst_entry_minute: str | None = None
+    minute_open_cvd: float | None = None
+    current_minute_key: str | None = None
+    prev_burst_poll_row: pd.Series | None = None
 
 
 def _env_path(name: str, default: str) -> Path:
@@ -72,6 +82,121 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
         fh.write(json.dumps(record, default=str) + "\n")
 
 
+class TradeLogDeduper:
+    """Skip duplicate round-trips on restart/replay."""
+
+    def __init__(self, trades_path: Path) -> None:
+        self._path = trades_path
+        self._seen_full: set[tuple[str, str, str, str, str]] = set()
+        self._seen_entry: set[tuple[str, str, str]] = set()
+        if trades_path.exists():
+            for line in trades_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    self._remember(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+    @staticmethod
+    def _normalize_price(value: Any) -> str:
+        try:
+            return f"{float(value):.4f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _remember(self, record: dict[str, Any]) -> None:
+        entry_time = str(record.get("entry_time", ""))
+        side = str(record.get("side", ""))
+        entry_price = self._normalize_price(record.get("entry_price", ""))
+        exit_time = str(record.get("exit_time", ""))
+        exit_reason = str(record.get("exit_reason", ""))
+        self._seen_full.add((entry_time, side, entry_price, exit_time, exit_reason))
+        self._seen_entry.add((entry_time, side, entry_price))
+
+    def is_duplicate(self, record: dict[str, Any]) -> bool:
+        entry_time = str(record.get("entry_time", ""))
+        side = str(record.get("side", ""))
+        entry_price = self._normalize_price(record.get("entry_price", ""))
+        exit_time = str(record.get("exit_time", ""))
+        exit_reason = str(record.get("exit_reason", ""))
+        full_key = (entry_time, side, entry_price, exit_time, exit_reason)
+        entry_key = (entry_time, side, entry_price)
+        return full_key in self._seen_full or entry_key in self._seen_entry
+
+    def append(self, record: dict[str, Any]) -> bool:
+        if self.is_duplicate(record):
+            logger.debug(
+                "Skipping duplicate trade log entry_time=%s side=%s",
+                record.get("entry_time"),
+                record.get("side"),
+            )
+            return False
+        self._remember(record)
+        _append_jsonl(self._path, record)
+        return True
+
+
+def _append_trade(
+    trades_path: Path,
+    trade: Trade,
+    mode: str,
+    deduper: TradeLogDeduper | None = None,
+) -> None:
+    record = _trade_record(trade, mode)
+    if deduper is not None:
+        deduper.append(record)
+    else:
+        _append_jsonl(trades_path, record)
+
+
+
+
+def _nt8_position_matches_entry(nt8_pos: int | None, side: Side, quantity: int) -> bool:
+    if nt8_pos is None or quantity <= 0:
+        return False
+    if side == Side.LONG:
+        return nt8_pos >= quantity
+    return nt8_pos <= -quantity
+
+
+def _wait_gateway_entry_fill(
+    gateway: LiveGateway,
+    side: Side,
+    quantity: int,
+    *,
+    order_type: str,
+    attempts: int = 6,
+    sleep_s: float = 0.35,
+) -> bool:
+    """Confirm NT8 holds the entry before the model keeps a position."""
+    tries = attempts if str(order_type).upper() == "LIMIT" else max(3, attempts // 2)
+    for attempt in range(tries):
+        if _nt8_position_matches_entry(gateway.query_market_position(), side, quantity):
+            return True
+        if attempt + 1 < tries:
+            time.sleep(sleep_s)
+    return False
+
+def _clear_position_if_gateway_flat(
+    state: RunnerState,
+    gateway: LiveGateway | None,
+) -> None:
+    """Drop in-memory position when NT8 confirms flat (post-block or restart)."""
+    if gateway is None or state.position is None:
+        return
+    nt8_pos = gateway.query_market_position()
+    if nt8_pos is None:
+        return
+    if nt8_pos == 0:
+        logger.info(
+            "Gateway flat — clearing phantom in-memory %s position",
+            state.position.side.value,
+        )
+        state.position = None
+
+
 def _trade_record(trade: Trade, mode: str) -> dict[str, Any]:
     return {
         "mode": mode,
@@ -92,6 +217,276 @@ def _trade_record(trade: Trade, mode: str) -> dict[str, Any]:
     }
 
 
+
+
+def _resolve_entry_price(signal, config: ScalperConfig) -> float | None:
+    """Logs and gateway price: live bid/ask when NT8 LIMIT demo entries are enabled."""
+    slippage_fill = _apply_slippage(
+        signal.price, signal.side, True,
+        config.backtest.slippage_ticks, config.tick_size,
+    )
+    try:
+        import sys
+
+        fb_root = os.getenv("FUTURESBOT_ROOT", r"C:\FuturesBot")
+        if fb_root not in sys.path:
+            sys.path.insert(0, fb_root)
+        from nt8_market_sanity import demo_limit_entries_enabled, limit_entry_price
+
+        if demo_limit_entries_enabled():
+            root = str(config.symbol or "MNQ").upper()[:3]
+            live = limit_entry_price(root, signal.side.value, offset_ticks=0.0)
+            if live and live > 0:
+                return float(live)
+            logger.warning(
+                "limit entry price unavailable for %s %s (bar=%.2f) — skipping entry",
+                signal.side.value,
+                root,
+                float(signal.price or 0),
+            )
+            return None
+    except Exception as exc:
+        logger.debug("limit entry price fallback to slippage: %s", exc)
+    return slippage_fill
+
+
+def _minute_key(ts: Any) -> str:
+    if isinstance(ts, str):
+        ts = pd.to_datetime(ts)
+    if hasattr(ts, "strftime"):
+        return ts.strftime("%Y-%m-%d %H:%M")
+    return str(ts)[:16]
+
+
+def _sync_minute_state(state: RunnerState, row: pd.Series, config: ScalperConfig) -> None:
+    """Reset per-minute burst guards when the forming bar minute changes."""
+    key = _minute_key(row["timestamp"])
+    if state.current_minute_key == key:
+        return
+    state.current_minute_key = key
+    state.flow_burst_entry_minute = None
+    state.prev_burst_poll_row = None
+    if config.entry.flow_burst_mode:
+        snap, cvd_open = build_intrabar_snapshot_row(
+            config.symbol[:3],
+            minute_bar_row=row,
+            cvd_at_minute_open=None,
+        )
+        state.minute_open_cvd = cvd_open if snap is not None else None
+
+
+def _flow_burst_cooldown_active(state: RunnerState, config: ScalperConfig) -> bool:
+    if state.last_flow_burst_entry_ts <= 0:
+        return False
+    elapsed = time.monotonic() - state.last_flow_burst_entry_ts
+    return elapsed < config.entry.flow_burst_cooldown_sec
+
+
+def _already_entered_this_minute(state: RunnerState, row: pd.Series) -> bool:
+    key = _minute_key(row["timestamp"])
+    return state.flow_burst_entry_minute == key
+
+
+def _maybe_enrich_entry_row(
+    row: pd.Series,
+    config: ScalperConfig,
+    state: RunnerState,
+) -> pd.Series:
+    """Poll orderflow.json on a timer and merge live depth/MBO into the entry row."""
+    if not config.entry.use_flow_signals:
+        return row
+    now = time.monotonic()
+    poll_sec = max(
+        float(config.entry.orderflow_poll_sec or 0),
+        float(config.entry.flow_burst_poll_sec or 0),
+    )
+    if poll_sec > 0 and now - state.last_orderflow_poll_ts < poll_sec:
+        return row
+    state.last_orderflow_poll_ts = now
+    enriched = enrich_bar_from_orderflow(
+        config.symbol[:3],
+        row,
+        max_age_sec=config.entry.orderflow_max_age_sec,
+    )
+    return enriched if enriched is not None else row
+
+
+def _mark_flow_burst_entry(state: RunnerState, row: pd.Series) -> None:
+    state.flow_burst_entry_minute = _minute_key(row["timestamp"])
+    state.last_flow_burst_entry_ts = time.monotonic()
+
+
+def _resolve_entry_signal(
+    row: pd.Series,
+    prev: pd.Series,
+    state: RunnerState,
+    config: ScalperConfig,
+    i: int,
+    ts: Any,
+) -> Any:
+    """Pick flow-burst or pullback entry path based on config."""
+    if _already_entered_this_minute(state, row):
+        return None
+    prev_atr = float(prev.get("atr", 0))
+    session_bar = state.session_bar
+    bar_time = ts if isinstance(ts, datetime) else pd.to_datetime(ts)
+
+    if config.entry.flow_burst_mode:
+        return evaluate_flow_burst_entry(
+            row, prev_atr, i, config, state.cooldown, session_bar, bar_time,
+            prev_row=prev, trend_row=row,
+        )
+    if config.entry.pullback_mode:
+        return evaluate_entry(
+            row, prev_atr, i, config, state.cooldown, session_bar, bar_time,
+            prev_row=prev,
+        )
+    return None
+
+
+def _execute_entry(
+    signal: Any,
+    row: pd.Series,
+    state: RunnerState,
+    config: ScalperConfig,
+    risk: RiskManager,
+    *,
+    mode: str,
+    signals_path: Path,
+    trades_path: Path,
+    gateway: LiveGateway | None,
+    trade_deduper: TradeLogDeduper | None,
+) -> None:
+    fill = _resolve_entry_price(signal, config)
+    if fill is None:
+        return
+    qty = risk.position_size()
+    ts = row["timestamp"]
+    state.position = init_position(signal.side, fill, state.bar_index, ts, qty, config)
+    state.entry_trend = signal.trend_score
+    state.entry_l2 = signal.l2_score
+
+    signal_record = {
+        "mode": mode,
+        "timestamp": str(ts),
+        "side": signal.side.value,
+        "price": fill,
+        "quantity": qty,
+        "trend_score": signal.trend_score,
+        "l2_score": signal.l2_score,
+        "reason": signal.reason,
+        "paper_only": paper_only_mode(),
+        "live_trading": live_trading_enabled(),
+        "nt8_demo_orders": demo_nt8_orders_enabled(),
+        "logged_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _append_jsonl(signals_path, signal_record)
+    logger.info("Signal: %s %s @ %s (%s)", signal.side.value, config.symbol, fill, signal.reason)
+
+    if "flow_burst" in signal.reason:
+        _mark_flow_burst_entry(state, row)
+
+    if gateway is not None:
+        result = gateway.submit_order(OrderRequest(
+            action=OrderAction.ENTER,
+            symbol=config.symbol,
+            side=signal.side,
+            quantity=qty,
+            price=fill,
+            reason=signal.reason,
+        ))
+        if is_entry_blocked(result):
+            logger.warning(
+                "Entry blocked by gateway (%s) — rolling back in-memory position",
+                result.get("status"),
+            )
+            state.position = None
+            _clear_position_if_gateway_flat(state, gateway)
+        elif not _wait_gateway_entry_fill(
+            gateway,
+            signal.side,
+            qty,
+            order_type=str(result.get("order_type") or "MARKET"),
+        ):
+            logger.warning(
+                "Entry submitted but NT8 not filled (%s) - rolling back model position",
+                result.get("order_id"),
+            )
+            state.position = None
+            _clear_position_if_gateway_flat(state, gateway)
+
+
+def _maybe_poll_flow_burst(
+    row: pd.Series,
+    prev: pd.Series,
+    state: RunnerState,
+    config: ScalperConfig,
+    risk: RiskManager,
+    *,
+    mode: str,
+    signals_path: Path,
+    trades_path: Path,
+    gateway: LiveGateway | None,
+    trade_deduper: TradeLogDeduper | None,
+) -> None:
+    """Poll orderflow.json between 1m bar closes for momentum burst entries."""
+    if not config.entry.flow_burst_mode:
+        return
+    if state.position is not None or state.cooldown > 0 or not risk.can_enter():
+        return
+    if _flow_burst_cooldown_active(state, config):
+        return
+    if _already_entered_this_minute(state, row):
+        return
+
+    now = time.monotonic()
+    poll_sec = max(
+        float(config.entry.flow_burst_poll_sec or 0),
+        float(config.entry.orderflow_poll_sec or 0),
+    )
+    if now - state.last_flow_burst_poll_ts < poll_sec:
+        return
+    state.last_flow_burst_poll_ts = now
+
+    snap, cvd_open = build_intrabar_snapshot_row(
+        config.symbol[:3],
+        minute_bar_row=row,
+        cvd_at_minute_open=state.minute_open_cvd,
+        prev_poll_row=state.prev_burst_poll_row,
+    )
+    if snap is None:
+        return
+    if state.minute_open_cvd is None:
+        state.minute_open_cvd = cvd_open
+
+    prev_snap = state.prev_burst_poll_row if state.prev_burst_poll_row is not None else prev
+    ts = row["timestamp"]
+    bar_time = ts if isinstance(ts, datetime) else pd.to_datetime(ts)
+    signal = evaluate_flow_burst_entry(
+        snap,
+        float(prev.get("atr", 0) or 0),
+        state.bar_index,
+        config,
+        state.cooldown,
+        state.session_bar,
+        bar_time,
+        prev_row=prev_snap,
+        trend_row=row,
+    )
+    state.prev_burst_poll_row = snap.copy()
+    if signal is None:
+        return
+
+    _execute_entry(
+        signal, snap, state, config, risk,
+        mode=mode,
+        signals_path=signals_path,
+        trades_path=trades_path,
+        gateway=gateway,
+        trade_deduper=trade_deduper,
+    )
+
+
 def process_bar(
     row: pd.Series,
     prev: pd.Series,
@@ -103,6 +498,7 @@ def process_bar(
     signals_path: Path,
     trades_path: Path,
     gateway: LiveGateway | None = None,
+    trade_deduper: TradeLogDeduper | None = None,
 ) -> list[Trade]:
     """Process one bar using the same rules as the backtester."""
     new_trades: list[Trade] = []
@@ -122,6 +518,10 @@ def process_bar(
         state.cooldown -= 1
 
     if state.position is not None:
+        _clear_position_if_gateway_flat(state, gateway)
+        if state.position is None:
+            state.bar_index += 1
+            return new_trades
         exit_price, reason = evaluate_exit(state.position, row, i, ts, config)
         if exit_price is not None and reason is not None:
             fill = _apply_slippage(
@@ -151,7 +551,7 @@ def process_bar(
             )
             new_trades.append(trade)
             risk.record_trade(trade)
-            _append_jsonl(trades_path, _trade_record(trade, mode))
+            _append_trade(trades_path, trade, mode, trade_deduper)
             if gateway is not None:
                 gateway.submit_order(OrderRequest(
                     action=OrderAction.EXIT,
@@ -170,47 +570,21 @@ def process_bar(
         state.bar_index += 1
         return new_trades
 
-    signal = evaluate_entry(
-        row, float(prev.get("atr", 0)), i, config, state.cooldown, state.session_bar,
-    )
+    _sync_minute_state(state, row, config)
+    entry_row = _maybe_enrich_entry_row(row, config, state)
+    signal = _resolve_entry_signal(entry_row, prev, state, config, i, ts)
     if signal is None:
         state.bar_index += 1
         return new_trades
 
-    fill = _apply_slippage(
-        signal.price, signal.side, True,
-        config.backtest.slippage_ticks, config.tick_size,
+    _execute_entry(
+        signal, row, state, config, risk,
+        mode=mode,
+        signals_path=signals_path,
+        trades_path=trades_path,
+        gateway=gateway,
+        trade_deduper=trade_deduper,
     )
-    qty = risk.position_size()
-    state.position = init_position(signal.side, fill, i, ts, qty, config)
-    state.entry_trend = signal.trend_score
-    state.entry_l2 = signal.l2_score
-
-    signal_record = {
-        "mode": mode,
-        "timestamp": str(ts),
-        "side": signal.side.value,
-        "price": fill,
-        "quantity": qty,
-        "trend_score": signal.trend_score,
-        "l2_score": signal.l2_score,
-        "reason": signal.reason,
-        "paper_only": paper_only_mode(),
-        "live_trading": live_trading_enabled(),
-        "logged_at": datetime.now(timezone.utc).isoformat(),
-    }
-    _append_jsonl(signals_path, signal_record)
-    logger.info("Signal: %s %s @ %s (%s)", signal.side.value, config.symbol, fill, signal.reason)
-
-    if gateway is not None:
-        gateway.submit_order(OrderRequest(
-            action=OrderAction.ENTER,
-            symbol=config.symbol,
-            side=signal.side,
-            quantity=qty,
-            price=fill,
-            reason=signal.reason,
-        ))
 
     state.bar_index += 1
     return new_trades
@@ -230,6 +604,7 @@ def run_replay(
     state = RunnerState(processed_timestamps=set())
     signals_path = log_dir / "signals.jsonl"
     trades_path = log_dir / "trades.jsonl"
+    trade_deduper = TradeLogDeduper(trades_path)
     all_trades: list[Trade] = []
 
     for i in range(1, len(df)):
@@ -242,6 +617,7 @@ def run_replay(
             signals_path=signals_path,
             trades_path=trades_path,
             gateway=gateway,
+            trade_deduper=trade_deduper,
         ))
 
     if state.position is not None:
@@ -270,7 +646,7 @@ def run_replay(
             entry_l2_score=state.entry_l2,
         )
         all_trades.append(trade)
-        _append_jsonl(trades_path, _trade_record(trade, "replay"))
+        _append_trade(trades_path, trade, "replay", trade_deduper)
 
     summary = {
         "mode": "replay",
@@ -287,6 +663,64 @@ def run_replay(
     return summary
 
 
+def _checkpoint_path() -> Path:
+    state_dir = Path(os.getenv("L2_SCALPER_STATE_DIR", r"C:\Bots\futures-trend-day-l2-scalper\state"))
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir / "paper_runner_checkpoint.json"
+
+
+def _load_follow_checkpoint() -> dict[str, Any]:
+    path = _checkpoint_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_follow_checkpoint(timestamp: str, state: RunnerState) -> None:
+    path = _checkpoint_path()
+    payload: dict[str, Any] = {
+        "last_processed_timestamp": timestamp,
+        "session_bar": state.session_bar,
+    }
+    if state.prev_session_date is not None:
+        payload["prev_session_date"] = str(state.prev_session_date)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _init_follow_session_state(df: pd.DataFrame, state: RunnerState) -> int:
+    """Seed session_bar from CSV so restart does not re-block min_bars_after_open."""
+    if state.processed_timestamps is None:
+        state.processed_timestamps = set()
+    timestamps = df["timestamp"].astype(str)
+    if len(timestamps) == 0:
+        return 0
+
+    last_ts = pd.to_datetime(timestamps.iloc[-1])
+    session_date = last_ts.date()
+    state.prev_session_date = session_date
+    bars_processed = sum(
+        1
+        for ts in timestamps
+        if ts in state.processed_timestamps and pd.to_datetime(ts).date() == session_date
+    )
+    state.session_bar = bars_processed
+    return bars_processed
+
+
+def _seed_follow_processed_bars(df: pd.DataFrame, state: RunnerState) -> str:
+    """Mark all bars before the last closed bar as processed; leave last bar eligible."""
+    if state.processed_timestamps is None:
+        state.processed_timestamps = set()
+    timestamps = df["timestamp"].astype(str)
+    for ts in timestamps.iloc[:-1]:
+        state.processed_timestamps.add(ts)
+    return str(timestamps.iloc[-1])
+
+
 def run_follow(
     config: ScalperConfig,
     data_path: Path,
@@ -299,16 +733,23 @@ def run_follow(
     """Follow a growing CSV from NinjaTrader 8 ScalperL2Exporter. Paper only."""
     signals_path = log_dir / "signals.jsonl"
     trades_path = log_dir / "trades.jsonl"
+    trade_deduper = TradeLogDeduper(trades_path)
     risk = RiskManager(config)
     state = RunnerState(processed_timestamps=set())
     history = pd.DataFrame()
+    initialized = False
 
-    logger.info("Following %s (poll=%ss, paper_only=%s)", data_path, poll_seconds, paper_only_mode())
+    logger.info(
+        "Following %s (poll=%ss, paper_only=%s)",
+        data_path,
+        poll_seconds,
+        paper_only_mode(),
+    )
 
     while True:
         if not data_path.exists():
             logger.warning(
-                "Bar file missing: %s — enable ScalperL2Exporter in NT8 (see integrations/ninjatrader8/README.md)",
+                "Bar file missing: %s â€” enable ScalperL2Exporter in NT8 (see integrations/ninjatrader8/README.md)",
                 data_path,
             )
             time.sleep(poll_seconds)
@@ -326,11 +767,30 @@ def run_follow(
             continue
 
         df = compute_indicators(df, config.trend)
-        if history.empty:
-            start = max(1, len(df) - warmup_bars)
-            history = df.iloc[:start].copy()
-            for ts in history["timestamp"].astype(str):
-                state.processed_timestamps.add(ts)
+        if not initialized:
+            session_date = pd.to_datetime(df["timestamp"].iloc[-1]).date()
+            risk.hydrate_from_jsonl(trades_path, session_date=session_date, mode="follow")
+            last_eligible = _seed_follow_processed_bars(df, state)
+            session_bars_processed = _init_follow_session_state(df, state)
+            checkpoint = _load_follow_checkpoint()
+            history = df.copy()
+            initialized = True
+            logger.info(
+                "Follow startup: marked %d prior bars processed; last bar %s eligible; "
+                "session_bar=%d (today processed=%d, checkpoint=%s); "
+                "risk trades_today=%d halted=%s reason=%s",
+                len(df) - 1,
+                last_eligible,
+                state.session_bar,
+                session_bars_processed,
+                checkpoint.get("session_bar", "-"),
+                risk.trades_today,
+                risk.halted,
+                risk.halt_reason or "-",
+            )
+            _clear_position_if_gateway_flat(state, gateway)
+            if gateway is not None:
+                gateway.cancel_orphan_orders(reason="follow_startup_reconcile")
 
         new_rows = df[~df["timestamp"].astype(str).isin(state.processed_timestamps)]
         for i in range(len(new_rows)):
@@ -351,10 +811,75 @@ def run_follow(
                 signals_path=signals_path,
                 trades_path=trades_path,
                 gateway=gateway,
+                trade_deduper=trade_deduper,
             )
             state.processed_timestamps.add(ts_key)
+            _save_follow_checkpoint(ts_key, state)
+
+        if initialized and len(df) >= 2:
+            last_row = df.iloc[-1]
+            prev_row = df.iloc[-2]
+            state.bar_index = len(df) - 1
+            _sync_minute_state(state, last_row, config)
+            _maybe_poll_flow_burst(
+                last_row, prev_row, state, config, risk,
+                mode="follow",
+                signals_path=signals_path,
+                trades_path=trades_path,
+                gateway=gateway,
+                trade_deduper=trade_deduper,
+            )
 
         time.sleep(poll_seconds)
+
+
+def _enforce_runner_safety() -> None:
+    """Block duplicate system-python roots; allow Windows venv base-python children."""
+    if os.name != "nt":
+        return
+    exe = Path(sys.executable).resolve()
+    if ".venv" in str(exe).replace("\\", "/").lower():
+        return
+    venv_root = os.getenv("VIRTUAL_ENV", "").strip()
+    if venv_root and Path(venv_root).is_dir():
+        return
+    raise SystemExit(
+        f"Refusing paper_runner outside install venv (python={exe}); "
+        "start via scripts/start_l2_scalper.ps1"
+    )
+
+
+def _acquire_single_instance() -> None:
+    """One paper_runner per machine; pidfile under install state/."""
+    if os.name != "nt":
+        return
+    import atexit
+    import ctypes
+
+    mutex_name = r"Global\FuturesBot.L2Scalper.PaperRunner"
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.CreateMutexW(None, True, mutex_name)
+    if kernel32.GetLastError() == 183:
+        raise SystemExit("paper_runner already running (mutex)")
+
+    state_dir = Path(os.getenv("L2_SCALPER_STATE_DIR", r"C:\\Bots\\futures-trend-day-l2-scalper\\state"))
+    state_dir.mkdir(parents=True, exist_ok=True)
+    pid_file = state_dir / "paper_runner.pid"
+    pid_file.write_text(str(os.getpid()), encoding="ascii")
+
+    def _cleanup() -> None:
+        try:
+            if pid_file.exists() and pid_file.read_text(encoding="ascii").strip() == str(os.getpid()):
+                pid_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            kernel32.ReleaseMutex(handle)
+            kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+    atexit.register(_cleanup)
 
 
 def main() -> None:
@@ -370,6 +895,9 @@ def main() -> None:
     parser.add_argument("--poll-seconds", type=float, default=float(os.getenv("POLL_SECONDS", "2")))
     args = parser.parse_args()
 
+    _enforce_runner_safety()
+    _acquire_single_instance()
+
     logging.basicConfig(
         level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -381,6 +909,7 @@ def main() -> None:
 
     gateway = LiveGateway(log_dir=log_dir)
     gateway.connect()
+    gateway.cancel_orphan_orders(reason="paper_runner_startup")
 
     data_path = resolve_bar_csv_path(args.data)
     if args.mode == "replay" and not args.data.strip():

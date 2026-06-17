@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -104,10 +105,14 @@ def evaluate_entry_mtf(
     config: ScalperConfig,
     cooldown_remaining: int,
     session_bar_index: int,
+    bar_time: datetime,
 ) -> object | None:
     from scalper.models import EntrySignal
+    from scalper.session_utils import rth_entry_block_reason
 
     if cooldown_remaining > 0:
+        return None
+    if rth_entry_block_reason(bar_time, config) is not None:
         return None
     if session_bar_index < config.entry.min_bars_after_open:
         return None
@@ -232,7 +237,7 @@ def run_mtf_backtest(
             continue
 
         prev_atr = float(prev.get("mtf_atr", prev.get("atr", 0)))
-        signal = evaluate_entry_mtf(row, prev_atr, i, config, cooldown, session_bar)
+        signal = evaluate_entry_mtf(row, prev_atr, i, config, cooldown, session_bar, ts)
         if signal is None:
             equity.append(equity[-1])
             continue

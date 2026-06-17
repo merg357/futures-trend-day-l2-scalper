@@ -160,7 +160,10 @@ def run_backtest(
             equity.append(equity[-1])
             continue
 
-        signal = evaluate_entry(row, float(prev.get("atr", 0)), i, config, cooldown, session_bar)
+        signal = evaluate_entry(
+            row, float(prev.get("atr", 0)), i, config, cooldown, session_bar, ts,
+            prev_row=prev,
+        )
         if signal is None:
             equity.append(equity[-1])
             continue

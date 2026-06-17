@@ -36,9 +36,11 @@ NT8 (Rithmic / sim feed)
 
 ## Chart setup
 
-1. **Connections** → connect **Rithmic** (or sim) with market data enabled for **MNQ**.
-2. Open an **MNQ** chart.
-3. Set interval to **1 Minute**.
+**Critical:** Use **MNQ 06-26** (micro Nasdaq June 2026 front month), **not** `NQ 06-24` or full-size `NQ`. The exporter writes whatever instrument the chart shows — a wrong or replay chart (~301xx) mixed with live MNQ (~305xx) breaks the bot CSV and makes execution markers float hundreds of points above bars.
+
+1. **Connections** → connect **Rithmic** (or sim) with market data enabled for **MNQ 06-26**.
+2. Close any **NQ 06-24** or other wrong/expired charts.
+3. **New Chart** → instrument **MNQ 06-26** → interval **1 Minute** → **live** (not Market Replay on stale data).
 4. Right-click chart → **Strategies** → add **ScalperL2Exporter**.
 5. Set **ExportPath** to match your Python `.env`:
 
@@ -92,7 +94,8 @@ Ensure `.env` has `PAPER_ONLY=true`, `LIVE_TRADING=false`, and `BAR_CSV_PATH` po
 | Empty CSV | Strategy enabled? Rithmic connected? MNQ subscription active? |
 | `Bar file missing` in Python | Match `ExportPath` and `BAR_CSV_PATH`; create parent folder |
 | Stale L2 | Restart strategy after reconnect; check **Market Depth** window in NT8 |
-| Wrong symbol | Strategy uses chart instrument — use **MNQ** 1m chart |
+| Wrong symbol | Strategy uses **chart instrument** — must be **MNQ 06-26** 1m live; never NQ 06-24 or replay |
+| Price spike / 400pt gap on chart | Exporter on wrong chart + `l2_scalper_csv_bridge` injecting live MNQ — fix chart first, dedupe CSV |
 
 ## Security
 

@@ -46,6 +46,27 @@ class L2Config(BaseModel):
     approximation_when_missing: bool = True
 
 
+class FlowConfig(BaseModel):
+    """Circled-move flow gates (CSV bar fields only — no MBO parquet)."""
+
+    min_flow_score: float = 50.0
+    flow_strong_score: float = 70.0
+    relaxed_min_trend_score: float = 35.0
+    min_triggers: int = 2
+    short_delta_max: float = -8.0
+    long_delta_min: float = 6.0
+    strong_delta_magnitude: float = 15.0
+    imbalance_threshold: float = 0.55
+    book_size_ratio: float = 2.0
+    ask_shrink_min_drop: float = 0.15
+    depth_spike_ratio: float = 1.25
+    weight_delta: float = 40.0
+    weight_imbalance: float = 30.0
+    weight_book_change: float = 30.0
+    use_mbo_new_counts: bool = True
+    min_depth_event_rate_per_min: float = 0.0  # 0 = disabled; research ~8k-13k/min
+
+
 class EntryConfig(BaseModel):
     chop_filter_enabled: bool = True
     chop_adx_max: float = 18.0
@@ -53,31 +74,41 @@ class EntryConfig(BaseModel):
     pullback_to_ema_ticks: int = 3
     max_spread_ticks: int = 4
     require_l2_confirmation: bool = True
-    min_bars_after_open: int = 5
+    use_flow_signals: bool = False
+    # Flow burst: intrabar momentum entries (L2/DOM proxy via orderflow.json — not live MBO parquet).
+    flow_burst_mode: bool = False
+    flow_burst_poll_sec: float = 15.0
+    flow_burst_cooldown_sec: float = 30.0
+    orderflow_poll_sec: float = 10.0
+    orderflow_max_age_sec: float = 45.0
+    pullback_required_for_burst: bool = False
+    pullback_mode: bool = True
+    min_bars_after_open: int = 0
     cooldown_bars_after_exit: int = 3
+    rth_only: bool = False
 
 
 class ExitConfig(BaseModel):
-    stop_loss_ticks: int = 10
-    take_profit_ticks: int = 20
+    stop_loss_ticks: int = 30
+    take_profit_ticks: int = 200
     breakeven_enabled: bool = True
-    breakeven_trigger_ticks: int = 8
+    breakeven_trigger_ticks: int = 15
     breakeven_offset_ticks: int = 1
     trailing_enabled: bool = True
-    trailing_trigger_ticks: int = 12
-    trailing_offset_ticks: int = 6
-    max_hold_bars: int = 45
+    trailing_trigger_ticks: int = 15
+    trailing_offset_ticks: int = 5
+    max_hold_bars: int = 0  # 0 = disabled
     l2_reversal_exit_enabled: bool = True
     l2_reversal_threshold: float = 35.0
-    exit_at_session_end: bool = True
+    exit_at_session_end: bool = False
 
 
 class RiskConfig(BaseModel):
     max_contracts: int = 1
-    max_trades_per_session: int = 8
+    max_trades_per_session: int = 0  # 0 = disabled
     max_daily_loss_dollars: float = 250.0
     risk_per_trade_dollars: float = 40.0
-    max_consecutive_losses: int = 3
+    max_consecutive_losses: int = 0  # 0 = disabled
 
 
 class BacktestConfig(BaseModel):
@@ -103,6 +134,7 @@ class ScalperConfig(BaseModel):
     session: SessionConfig = Field(default_factory=SessionConfig)
     trend: TrendConfig = Field(default_factory=TrendConfig)
     l2: L2Config = Field(default_factory=L2Config)
+    flow: FlowConfig = Field(default_factory=FlowConfig)
     entry: EntryConfig = Field(default_factory=EntryConfig)
     exit: ExitConfig = Field(default_factory=ExitConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)

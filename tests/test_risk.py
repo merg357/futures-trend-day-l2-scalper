@@ -43,3 +43,33 @@ def test_consecutive_losses_halts() -> None:
     rm.record_trade(_trade(-10))
     rm.record_trade(_trade(-10))
     assert rm.halted is True
+
+
+def test_max_trades_disabled_when_zero() -> None:
+    cfg = load_config(ROOT / "configs" / "mnq_default.yaml")
+    cfg.risk.max_trades_per_session = 0
+    rm = RiskManager(cfg)
+    for _ in range(10):
+        rm.record_trade(_trade(10))
+    assert rm.can_enter() is True
+
+
+def test_consecutive_losses_disabled_when_zero() -> None:
+    cfg = load_config(ROOT / "configs" / "mnq_default.yaml")
+    cfg.risk.max_consecutive_losses = 0
+    rm = RiskManager(cfg)
+    for _ in range(5):
+        rm.record_trade(_trade(-10))
+    assert rm.halted is False
+    assert rm.can_enter() is True
+
+
+def test_daily_loss_disabled_when_zero() -> None:
+    cfg = load_config(ROOT / "configs" / "mnq_default.yaml")
+    cfg.risk.max_daily_loss_dollars = 0
+    cfg.risk.max_consecutive_losses = 0
+    rm = RiskManager(cfg)
+    for _ in range(5):
+        rm.record_trade(_trade(-100))
+    assert rm.halted is False
+    assert rm.can_enter() is True
