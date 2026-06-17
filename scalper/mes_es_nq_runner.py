@@ -27,6 +27,61 @@ from scalper.trading_safety import demo_nt8_orders_enabled, paper_only_mode
 
 logger = logging.getLogger(__name__)
 
+_ENT_ORDER_MARKERS = ("_ENT_", "_ENT")
+
+
+def _ent_order_prefix(config) -> str:
+    raw = str(config.mes_execution.order_id_prefix or "L2MES").strip()
+    tag = raw if raw.endswith("_") else f"{raw}_"
+    return f"{tag}ENT"
+
+
+def _has_working_ent_order(gateway: LiveGateway, config) -> tuple[bool, str]:
+    """True when NT8 still has a working L2MES_ENT (or configured prefix) entry."""
+    prefix = _ent_order_prefix(config)
+    try:
+        import sys
+
+        fb_root = os.getenv("FUTURESBOT_ROOT", r"C:\FuturesBot")
+        if fb_root not in sys.path:
+            sys.path.insert(0, fb_root)
+        from l2_nt8_orphan_guard import query_account_orders
+
+        q = query_account_orders(
+            gateway._account,
+            symbol_instruments=[(gateway._execution_symbol, gateway._instrument)],
+        )
+        if not q.get("api_ok"):
+            return False, ""
+        for order in q.get("working_orders") or []:
+            oid = str(order.get("order_id") or "")
+            upper = oid.upper()
+            if upper.startswith(prefix.upper()) or any(m in upper for m in _ENT_ORDER_MARKERS):
+                return True, oid
+    except Exception as exc:
+        logger.debug("ENT working-order query skipped: %s", exc)
+    return False, ""
+
+
+def mes_entry_blocked_reason(
+    gateway: LiveGateway | None,
+    config,
+    *,
+    pending_entry: object | None = None,
+) -> str | None:
+    """Block duplicate MES entries when NT8 is non-flat or ENT is still working."""
+    if gateway is None or not config.is_mes_es_nq_mode():
+        return None
+    if pending_entry is not None:
+        return "pending_l2mes_ent_in_memory"
+    pos = gateway.query_market_position()
+    if pos is not None and pos != 0:
+        return f"mes_position_nonzero={pos}"
+    working, oid = _has_working_ent_order(gateway, config)
+    if working:
+        return f"pending_l2mes_ent_working={oid}"
+    return None
+
 DEFAULT_CONFIG = "configs/production/mes_es_nq_raw_test.yaml"
 STATE_STATUS = Path(os.getenv("FUTURESBOT_ROOT", r"C:\FuturesBot")) / "state" / "mes_es_nq_runner_status.json"
 

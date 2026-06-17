@@ -154,6 +154,80 @@ def _market_sanity_block(account: str, symbol: str, signal_price: float) -> tupl
         return True, f"market sanity unavailable: {exc}"
 
 
+def _mes_tick_size() -> float:
+    try:
+        return float(os.getenv("MES_TICK_SIZE", "0.25") or 0.25)
+    except (TypeError, ValueError):
+        return 0.25
+
+
+def _round_tick(price: float, tick: float) -> float:
+    if tick <= 0:
+        return round(price, 2)
+    return round(round(price / tick) * tick, 2)
+
+
+def _read_exec_market_quote(symbol: str) -> dict[str, float]:
+    """Best bid/ask/mid for execution symbol from FuturesBot orderflow."""
+    of_path = Path(os.getenv("FUTURESBOT_ROOT", r"C:\FuturesBot")) / "state" / "orderflow.json"
+    out = {"bid": 0.0, "ask": 0.0, "mid": 0.0}
+    if not of_path.exists():
+        return out
+    try:
+        row = (json.loads(of_path.read_text(encoding="utf-8")).get(symbol.upper()) or {})
+    except Exception:
+        return out
+    if not isinstance(row, dict):
+        return out
+    bids = row.get("bid_levels") or []
+    asks = row.get("ask_levels") or []
+    if bids:
+        out["bid"] = float(bids[0].get("price") or 0)
+    if asks:
+        out["ask"] = float(asks[0].get("price") or 0)
+    mid = float(row.get("mid_price") or row.get("mid") or 0)
+    if mid <= 0 and out["bid"] > 0 and out["ask"] > 0:
+        mid = (out["bid"] + out["ask"]) / 2.0
+    elif mid <= 0 and out["bid"] > 0:
+        mid = out["bid"]
+    elif mid <= 0 and out["ask"] > 0:
+        mid = out["ask"]
+    out["mid"] = mid
+    return out
+
+
+def _normalize_protective_stop(
+    side: Side,
+    stop_price: float,
+    *,
+    symbol: str,
+    tick: float | None = None,
+    stop_ticks: int = 10,
+) -> float:
+    """Ensure NT8-acceptable stop: long SELL stop below bid; short BUY stop above ask."""
+    tick = tick or _mes_tick_size()
+    stop_price = _round_tick(float(stop_price), tick)
+    q = _read_exec_market_quote(symbol)
+    bid, ask, mid = q["bid"], q["ask"], q["mid"]
+    if side == Side.LONG:
+        ref = bid if bid > 0 else mid
+        if ref > 0 and stop_price >= ref:
+            stop_price = _round_tick(ref - tick, tick)
+        if mid > 0 and stop_price >= mid:
+            stop_price = _round_tick(mid - stop_ticks * tick, tick)
+            if bid > 0 and stop_price >= bid:
+                stop_price = _round_tick(bid - tick, tick)
+    else:
+        ref = ask if ask > 0 else mid
+        if ref > 0 and stop_price <= ref:
+            stop_price = _round_tick(ref + tick, tick)
+        if mid > 0 and stop_price <= mid:
+            stop_price = _round_tick(mid + stop_ticks * tick, tick)
+            if ask > 0 and stop_price <= ask:
+                stop_price = _round_tick(ask + tick, tick)
+    return stop_price
+
+
 def _nt8_client_command(
     command: str,
     account: str,
@@ -164,6 +238,8 @@ def _nt8_client_command(
     order_id: str,
     limit_price: float = 0.0,
     stop_price: float = 0.0,
+    *,
+    tif: str = "DAY",
 ) -> bool:
     ps_cmd = (
         f'$asm = [System.Reflection.Assembly]::LoadFile("{_NT8_DLL}"); '
@@ -172,7 +248,7 @@ def _nt8_client_command(
         f'Start-Sleep -Milliseconds 500; '
         f'$c.ConfirmOrders(0); '
         f'$r = $c.Command("{command}", "{account}", "{instrument}", "{action}", '
-        f'{qty}, "{order_type}", {limit_price}, {stop_price}, "DAY", "", "{order_id}", "", ""); '
+        f'{qty}, "{order_type}", {limit_price}, {stop_price}, "{tif}", "", "{order_id}", "", ""); '
         f'$c.TearDown(); '
         f'exit $r'
     )
@@ -200,6 +276,32 @@ def _nt8_client_command(
     except Exception as exc:
         logger.error("NT8 command error: %s", exc)
         return False
+
+
+def _nt8_place_stop_market(
+    account: str,
+    instrument: str,
+    action: str,
+    qty: int,
+    order_id: str,
+    stop_price: float,
+) -> tuple[bool, str]:
+    """Place protective STOPMARKET; prefer GTC on Sim101, fall back to DAY."""
+    for tif in ("GTC", "DAY"):
+        if _nt8_client_command(
+            "PLACE",
+            account,
+            instrument,
+            action,
+            qty,
+            "STOPMARKET",
+            order_id,
+            0.0,
+            stop_price,
+            tif=tif,
+        ):
+            return True, tif
+    return False, ""
 
 
 class LiveGateway:
@@ -378,20 +480,64 @@ class LiveGateway:
         tag = reason.replace(" ", "_")[:20] or "STOP"
         order_id = self._next_order_id(f"STP_{tag}")
         nt8_action = "SELL" if side == Side.LONG else "BUYTOCOVER"
-        ok = _nt8_client_command(
-            "PLACE",
+        tick = _mes_tick_size()
+        stop_ticks = int(os.getenv("MES_STOP_LOSS_TICKS", "10") or 10)
+        quote = _read_exec_market_quote(self._execution_symbol)
+        norm_stop = _normalize_protective_stop(
+            side,
+            float(stop_price),
+            symbol=self._execution_symbol,
+            tick=tick,
+            stop_ticks=stop_ticks,
+        )
+        payload["stop_price_requested"] = float(stop_price)
+        payload["stop_price"] = norm_stop
+        payload["market_bid"] = quote["bid"] or None
+        payload["market_ask"] = quote["ask"] or None
+        payload["market_mid"] = quote["mid"] or None
+        if side == Side.LONG and quote["bid"] > 0 and norm_stop >= quote["bid"]:
+            payload["status"] = "blocked_stop_above_bid"
+            self._audit("stop_blocked", payload)
+            return payload
+        if side == Side.SHORT and quote["ask"] > 0 and norm_stop <= quote["ask"]:
+            payload["status"] = "blocked_stop_below_ask"
+            self._audit("stop_blocked", payload)
+            return payload
+        ok, tif = _nt8_place_stop_market(
             self._account,
             self._instrument,
             nt8_action,
             qty,
-            "STOPMARKET",
             order_id,
-            0.0,
-            float(stop_price),
+            norm_stop,
         )
+        payload["tif"] = tif or None
         payload["status"] = "submitted" if ok else "nt8_rejected"
         payload["order_id"] = order_id
         payload["nt8_action"] = nt8_action
+        if ok:
+            try:
+                import sys
+                import time as _time
+
+                fb_root = os.getenv("FUTURESBOT_ROOT", r"C:\FuturesBot")
+                if fb_root not in sys.path:
+                    sys.path.insert(0, fb_root)
+                from l2_nt8_orphan_guard import query_account_orders
+
+                _time.sleep(1.5)
+                q = query_account_orders(
+                    self._account,
+                    symbol_instruments=[(self._execution_symbol, self._instrument)],
+                )
+                statuses = (q.get("order_statuses") or {})
+                nt8_status = str(statuses.get(order_id) or "")
+                payload["nt8_order_status"] = nt8_status or None
+                if nt8_status.lower() in {"rejected", "cancelled"}:
+                    payload["status"] = "nt8_rejected"
+                    ok = False
+            except Exception as exc:
+                logger.warning("stop post-submit verify skipped: %s", exc)
         self._audit("stop_submitted" if ok else "stop_failed", payload)
         return payload
 

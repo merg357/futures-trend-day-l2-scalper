@@ -10,7 +10,8 @@ import pytest
 
 from scalper.config import load_config
 from scalper.entry_rules import evaluate_flow_burst_entry
-from scalper.live_gateway import LiveGateway, OrderAction, OrderRequest
+from scalper.live_gateway import LiveGateway, OrderAction, OrderRequest, _normalize_protective_stop
+from scalper.mes_es_nq_runner import mes_entry_blocked_reason
 from scalper.models import Side
 from scalper.nq_confirmation import nq_veto_reason
 
@@ -140,3 +141,61 @@ def test_exit_no_take_profit(mes_config) -> None:
         Side.LONG, 5500.0, 0, pd.Timestamp("2026-06-17 10:00:00"), 1, mes_config
     )
     assert pos.target_price > 6000.0
+
+
+def test_long_stop_normalized_below_bid() -> None:
+    """LONG protective stop must sit below live bid (NT8 rejects sell stop above market)."""
+    with patch(
+        "scalper.live_gateway._read_exec_market_quote",
+        return_value={"bid": 7510.0, "ask": 7510.25, "mid": 7510.125},
+    ):
+        stop = _normalize_protective_stop(
+            Side.LONG,
+            7511.5,
+            symbol="MES",
+            tick=0.25,
+            stop_ticks=10,
+        )
+    assert stop < 7510.0
+
+
+def test_submit_stop_order_blocks_when_still_above_bid() -> None:
+    gw = LiveGateway(
+        log_dir=ROOT / "data" / "test_mes_routing",
+        execution_symbol="MES",
+        order_prefix="L2MES",
+    )
+    with patch("scalper.live_gateway.nt8_orders_enabled", return_value=True):
+        with patch("scalper.live_gateway.require_live_trading"):
+            with patch(
+                "scalper.live_gateway._read_exec_market_quote",
+                return_value={"bid": 7510.0, "ask": 7510.25, "mid": 7510.125},
+            ):
+                with patch(
+                    "scalper.live_gateway._normalize_protective_stop",
+                    return_value=7510.25,
+                ):
+                    result = gw.submit_stop_order(
+                        side=Side.LONG,
+                        quantity=1,
+                        stop_price=7512.0,
+                        reason="initial_hard_stop",
+                    )
+    assert result["status"] == "blocked_stop_above_bid"
+
+
+def test_mes_entry_blocked_when_nt8_position_nonzero(mes_config) -> None:
+    gw = LiveGateway(execution_symbol="MES", order_prefix="L2MES")
+    gw.query_market_position = lambda: 1  # type: ignore[method-assign]
+    assert mes_entry_blocked_reason(gw, mes_config) == "mes_position_nonzero=1"
+
+
+def test_mes_entry_blocked_when_pending_ent_working(mes_config) -> None:
+    gw = LiveGateway(execution_symbol="MES", order_prefix="L2MES")
+    gw.query_market_position = lambda: 0  # type: ignore[method-assign]
+    with patch(
+        "scalper.mes_es_nq_runner._has_working_ent_order",
+        return_value=(True, "L2MES_ENT_flow_burst_123_1"),
+    ):
+        reason = mes_entry_blocked_reason(gw, mes_config)
+    assert reason == "pending_l2mes_ent_working=L2MES_ENT_flow_burst_123_1"

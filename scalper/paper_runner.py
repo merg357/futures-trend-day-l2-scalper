@@ -496,6 +496,15 @@ def _execute_entry(
     gateway: LiveGateway | None,
     trade_deduper: TradeLogDeduper | None,
 ) -> None:
+    if config.is_mes_es_nq_mode():
+        from scalper.mes_es_nq_runner import mes_entry_blocked_reason
+
+        block = mes_entry_blocked_reason(
+            gateway, config, pending_entry=state.pending_entry,
+        )
+        if block:
+            logger.warning("MES entry blocked (%s)", block)
+            return
     fill = _resolve_entry_price(signal, config)
     if fill is None:
         return
@@ -749,6 +758,14 @@ def _maybe_poll_flow_burst(
         return
     if state.pending_entry is not None:
         return
+    if config.is_mes_es_nq_mode():
+        from scalper.mes_es_nq_runner import mes_entry_blocked_reason
+
+        block = mes_entry_blocked_reason(
+            gateway, config, pending_entry=state.pending_entry,
+        )
+        if block:
+            return
     if _flow_burst_cooldown_active(state, config):
         return
     if _already_entered_this_minute(state, row):
