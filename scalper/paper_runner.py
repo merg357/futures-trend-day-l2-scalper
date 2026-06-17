@@ -766,10 +766,9 @@ def _execute_entry(
             order_type = str(result.get("order_type") or "MARKET").upper()
             order_id = str(result.get("order_id") or "")
             if order_type == "LIMIT" and order_id:
-                working_ts = time.monotonic()
                 state.pending_entry = PendingEntry(
                     order_id=order_id,
-                    submit_ts=working_ts,
+                    submit_ts=submit_ts,
                     side=signal.side,
                     limit_price=fill,
                     quantity=qty,
@@ -1399,13 +1398,18 @@ def run_follow(
             )
 
         if state.pending_entry is not None:
-            deadline = time.monotonic() + loop_sec
-            while state.pending_entry is not None and time.monotonic() < deadline:
+            timeout_sec = _entry_cancel_timeout_sec(config)
+            monitor_deadline = state.pending_entry.submit_ts + timeout_sec + 0.15
+            monitor_row = df.iloc[-1] if initialized and len(df) >= 1 else None
+            while state.pending_entry is not None and time.monotonic() < monitor_deadline:
                 _maybe_cancel_pending_entry_timeout(state, config, gateway, log_dir=log_dir)
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or state.pending_entry is None:
+                if monitor_row is not None:
+                    _maybe_poll_pending_entry_fill(
+                        monitor_row, state, config, gateway, log_dir=log_dir,
+                    )
+                if state.pending_entry is None:
                     break
-                time.sleep(min(_fast_poll_sec(config), remaining))
+                time.sleep(_fast_poll_sec(config))
         else:
             time.sleep(loop_sec)
 

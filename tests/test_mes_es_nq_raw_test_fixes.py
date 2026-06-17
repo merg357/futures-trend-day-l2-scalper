@@ -112,6 +112,67 @@ def test_entry_cancel_timeout_fires_before_poll_throttle(mes_config, monkeypatch
     assert state.pending_entry is None
 
 
+def test_pending_entry_submit_ts_uses_order_submit(monkeypatch, tmp_path) -> None:
+    """Pending LIMIT clock must start at gateway submit, not after fill-wait."""
+    from unittest.mock import MagicMock, patch
+
+    from scalper.models import Side
+    from scalper.paper_runner import RunnerState, _execute_entry
+    from scalper.risk import RiskManager
+
+    mes_config = load_config(MES_CONFIG)
+    gateway = MagicMock()
+    gateway.submit_order.return_value = {
+        "order_id": "L2MES_ENT_test",
+        "order_type": "LIMIT",
+        "status": "submitted",
+    }
+    gateway.query_market_position.return_value = 0
+
+    mono_values = iter([999.0, 1000.0, 1010.0])
+    monkeypatch.setattr("scalper.paper_runner.time.monotonic", lambda: next(mono_values, 1010.0))
+    monkeypatch.setattr("scalper.paper_runner._wait_gateway_entry_fill", lambda *a, **k: False)
+    monkeypatch.setattr(
+        "scalper.paper_runner._resolve_entry_price",
+        lambda *a, **k: (5000.0, {"mes_bid_at_submit": 5000.0, "mes_ask_at_submit": 5000.25}),
+    )
+    monkeypatch.setattr("scalper.paper_runner._read_mes_quote", lambda *a, **k: {})
+    monkeypatch.setattr("scalper.paper_runner._append_jsonl", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "scalper.mes_es_nq_runner.mes_entry_blocked_reason",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "scalper.nq_confirmation.nq_veto_comparison",
+        lambda *a, **k: {"nq_veto_strict_would_block": False, "nq_veto_soft_blocks": False},
+    )
+
+    class _Sig:
+        side = Side.LONG
+        price = 5000.0
+        trend_score = 50.0
+        l2_score = 50.0
+        reason = "flow_burst_long_flow=70"
+
+    state = RunnerState()
+    row = pd.Series({"timestamp": "2026-06-17 16:00:00", "close": 5000.0})
+    _execute_entry(
+        _Sig(),
+        row,
+        state,
+        mes_config,
+        RiskManager(mes_config),
+        mode="follow",
+        signals_path=tmp_path / "signals.jsonl",
+        trades_path=tmp_path / "trades.jsonl",
+        gateway=gateway,
+        trade_deduper=None,
+        log_dir=tmp_path,
+    )
+    assert state.pending_entry is not None
+    assert state.pending_entry.submit_ts == 1000.0
+
+
 def test_adverse_mid_cancel_ticks_12(mes_config) -> None:
     assert mes_config.entry.entry_adverse_mid_ticks == 12
     assert mes_config.entry.use_adverse_mid_cancel is True

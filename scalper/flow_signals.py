@@ -347,10 +347,15 @@ def enrich_bar_from_orderflow(
         snap[key] = value
     bid_levels = mnq.get("bid_levels") or []
     ask_levels = mnq.get("ask_levels") or []
+    tick = float(mnq.get("spread") or 0.25) or 0.25
     if bid_levels:
         snap["bid"] = float(bid_levels[0]["price"])
     if ask_levels:
         snap["ask"] = float(ask_levels[0]["price"])
+    if snap.get("bid") is not None and snap.get("ask") is None and bid_levels:
+        snap["ask"] = float(bid_levels[0]["price"]) + tick
+    elif snap.get("ask") is not None and snap.get("bid") is None and ask_levels:
+        snap["bid"] = float(ask_levels[0]["price"]) - tick
     cvd_now = float(mnq.get("cvd") or 0)
     if cvd_now and (pd.isna(snap.get("delta")) or float(snap.get("delta") or 0) == 0.0):
         snap["delta"] = float(mnq.get("cvd_recent") or 0)
