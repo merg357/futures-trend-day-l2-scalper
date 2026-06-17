@@ -76,7 +76,7 @@ def test_flow_burst_blocked_by_nq_veto(mes_config) -> None:
         }
     )
     trend = TrendScore(score=80.0, bias=Bias.LONG, components={})
-    with patch("scalper.entry_rules.nq_veto_reason", return_value="nq_veto_bearish score=60"):
+    with patch("scalper.entry_rules.nq_veto_comparison", return_value={"nq_veto_reason": "nq_veto_bearish score=70", "nq_veto_soft_blocks": True}):
         with patch("scalper.entry_rules.compute_trend_score", return_value=trend):
             with patch("scalper.entry_rules.compute_flow_signal") as mock_flow:
                 from scalper.flow_signals import FlowSignal

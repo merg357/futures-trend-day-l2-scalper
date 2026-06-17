@@ -93,6 +93,13 @@ def _apply_mes_env(config) -> None:
     os.environ["NT8_ORDER_PREFIX"] = config.mes_execution.order_id_prefix
     os.environ["MES_ENTRY_CHASE_TICKS"] = str(config.mes_execution.entry_chase_ticks)
     os.environ["MES_TICK_SIZE"] = str(config.tick_size)
+    os.environ["MES_ENTRY_TIMEOUT_MS"] = str(config.mes_execution.entry_timeout_ms)
+    os.environ["MES_ENTRY_ORDER_MODE"] = config.mes_execution.entry_order_mode
+    os.environ["MES_MAX_SPREAD_TICKS"] = str(config.mes_execution.max_spread_ticks)
+    os.environ["MES_RESAMPLE_QUOTE"] = "1" if config.mes_execution.resample_mes_quote_before_submit else "0"
+    os.environ["MES_BLOCK_FILL_DIVERGENCE"] = "1" if config.mes_execution.block_on_fill_divergence else "0"
+    os.environ["MES_LOG_FILL_DIVERGENCE"] = "1" if config.mes_execution.log_fill_divergence else "0"
+    os.environ["MES_STOP_LOSS_TICKS"] = str(config.exit.stop_loss_ticks)
 
 
 def _write_runner_status(config, *, log_dir: Path, data_path: Path, mode: str) -> None:
@@ -125,7 +132,9 @@ def main() -> None:
     parser.add_argument("--data", default="", help="ES/MNQ bar CSV for trend context")
     parser.add_argument("--mode", choices=["replay", "follow"], default=os.getenv("RUNNER_MODE", "follow"))
     parser.add_argument("--log-dir", default=os.getenv("LIVE_LOG_DIR", "data/live_mes_es_nq"))
-    parser.add_argument("--poll-seconds", type=float, default=float(os.getenv("POLL_SECONDS", "2")))
+    parser.add_argument("--poll-seconds", type=float, default=float(
+        os.getenv("POLL_SECONDS", os.getenv("MES_DECISION_LOOP_SEC", "0.25"))
+    ))
     args = parser.parse_args()
 
     config = load_config(args.config)

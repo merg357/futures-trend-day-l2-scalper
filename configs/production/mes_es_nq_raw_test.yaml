@@ -24,13 +24,25 @@ filters:
 nq_confirmation:
   use_nq_confirmation: true
   nq_veto_threshold: 55.0
+  nq_opposing_flow_veto: 65.0
+  nq_obi_veto_threshold: 0.65
+  nq_veto_min_flow_for_obi: 55.0
 mes_execution:
   max_spread_ticks: 2
   entry_chase_ticks: 1
-  entry_timeout_ms: 400
+  entry_timeout_ms: 1500
   quote_max_age_sec: 5.0
   order_id_prefix: L2MES
   submit_hard_stop_on_fill: true
+  entry_order_mode: MARKETABLE_LIMIT
+  resample_mes_quote_before_submit: true
+  block_on_fill_divergence: false
+  log_fill_divergence: true
+raw_test_runtime:
+  decision_loop_ms: 250
+  order_monitor_loop_ms: 250
+  exit_monitor_loop_ms: 250
+  dashboard_refresh_ms: 2000
 session:
   timezone: America/New_York
   rth_open: '09:30'
@@ -90,10 +102,15 @@ entry:
   flow_burst_mode: true
   flow_burst_poll_sec: 15
   flow_burst_cooldown_sec: 30
+  use_burst_cooldown: false
+  use_one_entry_per_minute: false
+  use_per_minute_dedup: false
+  min_seconds_between_entries: 0
   orderflow_poll_sec: 10
   orderflow_max_age_sec: 45
-  entry_cancel_timeout_sec: 0.4
-  entry_adverse_mid_ticks: 9
+  entry_cancel_timeout_sec: 1.5
+  use_adverse_mid_cancel: true
+  entry_adverse_mid_ticks: 12
   pullback_required_for_burst: false
   pullback_mode: false
   min_bars_after_open: 0

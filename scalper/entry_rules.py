@@ -14,7 +14,7 @@ from scalper.flow_signals import (
     flow_burst_passes,
     flow_supports_side,
 )
-from scalper.nq_confirmation import nq_veto_reason
+from scalper.nq_confirmation import nq_veto_comparison, nq_veto_reason
 from scalper.session_utils import rth_entry_block_reason
 from scalper.l2_score import compute_l2_score
 from scalper.models import Bias, EntrySignal, Side
@@ -118,15 +118,14 @@ def _entry_guards(
         return "session_warmup"
     if is_chop(row, config.entry):
         return "chop"
-    bid = row.get("bid")
-    ask = row.get("ask")
-    max_spread = config.entry.max_spread_ticks
-    if config.is_mes_es_nq_mode():
-        max_spread = config.mes_execution.max_spread_ticks
-    if pd.notna(bid) and pd.notna(ask) and max_spread > 0:
-        spread_ticks = (float(ask) - float(bid)) / config.tick_size
-        if spread_ticks > max_spread:
-            return "spread"
+    if not config.is_mes_es_nq_mode():
+        bid = row.get("bid")
+        ask = row.get("ask")
+        max_spread = config.entry.max_spread_ticks
+        if pd.notna(bid) and pd.notna(ask) and max_spread > 0:
+            spread_ticks = (float(ask) - float(bid)) / config.tick_size
+            if spread_ticks > max_spread:
+                return "spread"
     return None
 
 
@@ -181,8 +180,8 @@ def evaluate_flow_burst_entry(
     if config.entry.require_l2_confirmation and not l2_ok and not flow_ok:
         return None
 
-    veto = nq_veto_reason(side, config)
-    if veto:
+    veto_cmp = nq_veto_comparison(side, config)
+    if veto_cmp.get("nq_veto_reason"):
         return None
 
     return EntrySignal(

@@ -42,15 +42,29 @@ class FilterFlagsConfig(BaseModel):
 class NqConfirmationConfig(BaseModel):
     use_nq_confirmation: bool = False
     nq_veto_threshold: float = 55.0
+    nq_opposing_flow_veto: float = 65.0
+    nq_obi_veto_threshold: float = 0.65
+    nq_veto_min_flow_for_obi: float = 55.0
 
 
 class MesExecutionConfig(BaseModel):
     max_spread_ticks: int = 2
     entry_chase_ticks: int = 1
-    entry_timeout_ms: int = 400
+    entry_timeout_ms: int = 1500
     quote_max_age_sec: float = 5.0
     order_id_prefix: str = "L2MES"
     submit_hard_stop_on_fill: bool = True
+    entry_order_mode: str = "MARKETABLE_LIMIT"
+    resample_mes_quote_before_submit: bool = True
+    block_on_fill_divergence: bool = False
+    log_fill_divergence: bool = True
+
+
+class RawTestRuntimeConfig(BaseModel):
+    decision_loop_ms: int = 250
+    order_monitor_loop_ms: int = 250
+    exit_monitor_loop_ms: int = 250
+    dashboard_refresh_ms: int = 2000
 
 
 class SessionConfig(BaseModel):
@@ -123,9 +137,14 @@ class EntryConfig(BaseModel):
     flow_burst_mode: bool = False
     flow_burst_poll_sec: float = 15.0
     flow_burst_cooldown_sec: float = 30.0
+    use_burst_cooldown: bool = True
+    use_one_entry_per_minute: bool = True
+    use_per_minute_dedup: bool = True
+    min_seconds_between_entries: float = 0.0
     orderflow_poll_sec: float = 10.0
     orderflow_max_age_sec: float = 45.0
     entry_cancel_timeout_sec: float = 45.0
+    use_adverse_mid_cancel: bool = True
     entry_adverse_mid_ticks: int = 9
     pullback_required_for_burst: bool = False
     pullback_mode: bool = True
@@ -183,6 +202,7 @@ class ScalperConfig(BaseModel):
     filters: FilterFlagsConfig = Field(default_factory=FilterFlagsConfig)
     nq_confirmation: NqConfirmationConfig = Field(default_factory=NqConfirmationConfig)
     mes_execution: MesExecutionConfig = Field(default_factory=MesExecutionConfig)
+    raw_test_runtime: RawTestRuntimeConfig = Field(default_factory=RawTestRuntimeConfig)
     session: SessionConfig = Field(default_factory=SessionConfig)
     trend: TrendConfig = Field(default_factory=TrendConfig)
     l2: L2Config = Field(default_factory=L2Config)

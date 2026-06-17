@@ -93,6 +93,32 @@ def init_position(
     )
 
 
+def stop_is_correct_side_of_entry(side: Side, entry_price: float, stop_price: float) -> bool:
+    """Long stop must be below entry; short stop must be above entry."""
+    if entry_price <= 0 or stop_price <= 0:
+        return False
+    if side == Side.LONG:
+        return stop_price < entry_price
+    return stop_price > entry_price
+
+
+def stop_side_metadata(
+    side: Side,
+    entry_price: float,
+    stop_price: float,
+    tick_size: float,
+) -> dict[str, object]:
+    """Logging payload for stop placement verification."""
+    distance_ticks = abs(entry_price - stop_price) / tick_size if tick_size > 0 else 0.0
+    return {
+        "entry_side": side.value,
+        "entry_price": entry_price,
+        "initial_stop_price": stop_price,
+        "initial_stop_distance_ticks": round(distance_ticks, 2),
+        "stop_is_correct_side_of_entry": stop_is_correct_side_of_entry(side, entry_price, stop_price),
+    }
+
+
 def _effective_high_low(bar: pd.Series) -> tuple[float, float]:
     """On synthetic flat OHLC bars, merge bid/ask into extremes for exit checks."""
     high = float(bar["high"])

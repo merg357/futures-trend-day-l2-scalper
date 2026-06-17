@@ -458,6 +458,7 @@ class LiveGateway:
         quantity: int,
         stop_price: float,
         reason: str = "initial_stop",
+        entry_price: float | None = None,
     ) -> dict[str, Any]:
         """Submit protective STOP order after entry fill (MES raw test)."""
         payload: dict[str, Any] = {
@@ -495,6 +496,18 @@ class LiveGateway:
         payload["market_bid"] = quote["bid"] or None
         payload["market_ask"] = quote["ask"] or None
         payload["market_mid"] = quote["mid"] or None
+        if entry_price is not None and entry_price > 0:
+            from scalper.exit_rules import stop_is_correct_side_of_entry, stop_side_metadata
+
+            payload.update(stop_side_metadata(side, entry_price, norm_stop, tick))
+            if not payload.get("stop_is_correct_side_of_entry"):
+                payload["status"] = "blocked_stop_wrong_side"
+                self._audit("stop_blocked", payload)
+                logger.critical(
+                    "Refusing stop on wrong side: entry=%.2f stop=%.2f side=%s",
+                    entry_price, norm_stop, side.value,
+                )
+                return payload
         if side == Side.LONG and quote["bid"] > 0 and norm_stop >= quote["bid"]:
             payload["status"] = "blocked_stop_above_bid"
             self._audit("stop_blocked", payload)
@@ -570,13 +583,37 @@ class LiveGateway:
             self.cancel_orphan_orders(reason="pre_entry", before_entry=True)
             nt8_action = "BUY" if request.side == Side.LONG else "SELLSHORT"
             order_id = self._next_order_id(f"ENT_{tag}")
+            entry_mode = os.getenv("MES_ENTRY_ORDER_MODE", "MARKETABLE_LIMIT").strip().upper()
             chase_ticks = float(os.getenv("MES_ENTRY_CHASE_TICKS", "0") or 0)
-            use_marketable_limit = chase_ticks > 0 and request.price and request.price > 0
-            if use_marketable_limit:
+            tick = float(os.getenv("MES_TICK_SIZE", "0.25") or 0.25)
+            max_spread = float(os.getenv("MES_MAX_SPREAD_TICKS", "2") or 2)
+            resample = os.getenv("MES_RESAMPLE_QUOTE", "1").strip().lower() in {"1", "true", "yes"}
+            mes_quote = _read_exec_market_quote(self._execution_symbol)
+            payload["mes_bid_at_submit"] = mes_quote["bid"] or None
+            payload["mes_ask_at_submit"] = mes_quote["ask"] or None
+            if mes_quote["bid"] > 0 and mes_quote["ask"] > 0:
+                payload["mes_spread_at_submit"] = (mes_quote["ask"] - mes_quote["bid"]) / tick
+            payload["entry_order_mode"] = entry_mode
+            if resample and mes_quote["bid"] > 0 and mes_quote["ask"] > 0:
+                spread_ticks = (mes_quote["ask"] - mes_quote["bid"]) / tick
+                if spread_ticks > max_spread:
+                    payload["status"] = "blocked_spread"
+                    payload["cancel_reason"] = "cancel_spread"
+                    self._audit("order_blocked", payload)
+                    return payload
+            if entry_mode == "MARKET_DIAGNOSTIC":
+                entry_type = "MARKET"
+                limit_px = 0.0
+            elif chase_ticks > 0 and (resample or (request.price and request.price > 0)):
                 entry_type = "LIMIT"
-                tick = float(os.getenv("MES_TICK_SIZE", "0.25") or 0.25)
                 chase = chase_ticks * tick
-                limit_px = float(request.price) + chase if request.side == Side.LONG else float(request.price) - chase
+                if resample and mes_quote["bid"] > 0 and mes_quote["ask"] > 0:
+                    limit_px = mes_quote["ask"] + chase if request.side == Side.LONG else mes_quote["bid"] - chase
+                elif request.price and request.price > 0:
+                    limit_px = float(request.price) + chase if request.side == Side.LONG else float(request.price) - chase
+                else:
+                    entry_type = "MARKET"
+                    limit_px = 0.0
             else:
                 try:
                     import sys
@@ -597,16 +634,23 @@ class LiveGateway:
             if sanity_px > 0:
                 blocked, block_reason = _market_sanity_block(
                     self._account,
-                    str(request.symbol or "MNQ"),
+                    str(request.symbol or self._execution_symbol),
                     sanity_px,
                 )
+                block_on_div = os.getenv("MES_BLOCK_FILL_DIVERGENCE", "0").strip().lower() in {"1", "true", "yes"}
+                log_div = os.getenv("MES_LOG_FILL_DIVERGENCE", "1").strip().lower() in {"1", "true", "yes"}
+                payload["would_have_blocked_fill_divergence"] = blocked
                 if blocked:
-                    payload["status"] = "blocked_fill_divergence"
-                    payload["block_reason"] = block_reason
-                    payload["sanity_price"] = sanity_px
-                    self._audit("order_blocked", payload)
-                    logger.error("NT8 entry blocked (fill divergence): %s", block_reason)
-                    return payload
+                    payload["fill_divergence_reason"] = block_reason
+                    if log_div:
+                        self._audit("fill_divergence_log", payload)
+                    if block_on_div:
+                        payload["status"] = "blocked_fill_divergence"
+                        payload["block_reason"] = block_reason
+                        payload["sanity_price"] = sanity_px
+                        self._audit("order_blocked", payload)
+                        logger.error("NT8 entry blocked (fill divergence): %s", block_reason)
+                        return payload
             ok = _nt8_client_command(
                 "PLACE",
                 self._account,
