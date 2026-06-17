@@ -34,11 +34,12 @@ class RiskManager:
     def can_enter(self) -> bool:
         if self.halted:
             return False
+        flags = self.config.filters
         max_trades = self.config.risk.max_trades_per_session
-        if max_trades > 0 and self.trades_today >= max_trades:
+        if flags.use_trade_cap and max_trades > 0 and self.trades_today >= max_trades:
             return False
         max_loss = self.config.risk.max_daily_loss_dollars
-        if max_loss > 0 and self.daily_pnl <= -max_loss:
+        if flags.use_daily_loss_limit and max_loss > 0 and self.daily_pnl <= -max_loss:
             self.halted = True
             self.halt_reason = "max_daily_loss"
             return False

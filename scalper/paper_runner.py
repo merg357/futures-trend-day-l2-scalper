@@ -239,8 +239,51 @@ def _trade_record(trade: Trade, mode: str) -> dict[str, Any]:
 
 
 
+def _signal_orderflow_root(config: ScalperConfig) -> str:
+    return config.orderflow_root_for_signal()
+
+
+def _execution_orderflow_root(config: ScalperConfig) -> str:
+    return config.orderflow_root_for_execution()
+
+
+def _execution_symbol(config: ScalperConfig) -> str:
+    return config.execution_root()
+
+
+def _resolve_mes_entry_price(signal, config: ScalperConfig) -> float | None:
+    """Marketable limit reference from MES execution book (bid/ask + chase)."""
+    from scalper.flow_signals import enrich_bar_from_orderflow
+
+    root = _execution_orderflow_root(config)
+    snap = enrich_bar_from_orderflow(
+        root,
+        pd.Series({"close": signal.price}),
+        max_age_sec=config.mes_execution.quote_max_age_sec,
+    )
+    if snap is None:
+        return None
+    bid = snap.get("bid")
+    ask = snap.get("ask")
+    chase = config.mes_execution.entry_chase_ticks * config.tick_size
+    if signal.side == Side.LONG:
+        if pd.notna(ask):
+            return float(ask) + chase
+    else:
+        if pd.notna(bid):
+            return float(bid) - chase
+    return float(snap.get("close") or signal.price or 0) or None
+
+
 def _resolve_entry_price(signal, config: ScalperConfig) -> float | None:
     """Logs and gateway price: live bid/ask when NT8 LIMIT demo entries are enabled."""
+    if config.is_mes_es_nq_mode():
+        mes_px = _resolve_mes_entry_price(signal, config)
+        if mes_px is None or mes_px <= 0:
+            logger.warning("MES entry quote unavailable — skipping entry")
+            return None
+        return mes_px
+
     slippage_fill = _apply_slippage(
         signal.price, signal.side, True,
         config.backtest.slippage_ticks, config.tick_size,
@@ -296,7 +339,7 @@ def _sync_minute_state(state: RunnerState, row: pd.Series, config: ScalperConfig
     state.prev_burst_poll_row = None
     if config.entry.flow_burst_mode:
         snap, cvd_open = build_intrabar_snapshot_row(
-            config.symbol[:3],
+            _signal_orderflow_root(config),
             minute_bar_row=row,
             cvd_at_minute_open=None,
         )
@@ -332,7 +375,7 @@ def _maybe_enrich_entry_row(
         return row
     state.last_orderflow_poll_ts = now
     enriched = enrich_bar_from_orderflow(
-        config.symbol[:3],
+        _signal_orderflow_root(config),
         row,
         max_age_sec=config.entry.orderflow_max_age_sec,
     )
@@ -400,14 +443,15 @@ def _execute_exit(
     if gateway is not None:
         gateway.submit_order(OrderRequest(
             action=OrderAction.EXIT,
-            symbol=config.symbol,
+            symbol=_execution_symbol(config),
             side=state.position.side,
             quantity=state.position.quantity,
             price=fill,
             reason=reason.value,
         ))
+    cooldown_bars = config.entry.cooldown_bars_after_exit if config.filters.use_cooldown else 0
     state.position = None
-    state.cooldown = config.entry.cooldown_bars_after_exit
+    state.cooldown = cooldown_bars
     return trade
 
 
@@ -476,6 +520,18 @@ def _execute_entry(
         "nt8_demo_orders": demo_nt8_orders_enabled(),
         "logged_at": datetime.now(timezone.utc).isoformat(),
     }
+    if config.is_mes_es_nq_mode():
+        signal_record.update(
+            {
+                "strategy_mode": config.mode,
+                "execution_instrument": config.execution_root(),
+                "signal_instrument": config.signal_root(),
+                "confirmation_instrument": config.confirmation_root(),
+                "mes_entry_price": fill,
+                "es_signal_side": signal.side.value,
+                "es_flow_reason": signal.reason,
+            }
+        )
     _append_jsonl(signals_path, signal_record)
     logger.info("Signal: %s %s @ %s (%s)", signal.side.value, config.symbol, fill, signal.reason)
 
@@ -483,9 +539,10 @@ def _execute_entry(
         _mark_flow_burst_entry(state, row)
 
     if gateway is not None:
+        exec_sym = _execution_symbol(config)
         result = gateway.submit_order(OrderRequest(
             action=OrderAction.ENTER,
-            symbol=config.symbol,
+            symbol=exec_sym,
             side=signal.side,
             quantity=qty,
             price=fill,
@@ -498,12 +555,20 @@ def _execute_entry(
             )
             state.position = None
             _clear_position_if_gateway_flat(state, gateway)
-        elif not _wait_gateway_entry_fill(
+        elif _wait_gateway_entry_fill(
             gateway,
             signal.side,
             qty,
             order_type=str(result.get("order_type") or "MARKET"),
         ):
+            if config.is_mes_es_nq_mode() and config.mes_execution.submit_hard_stop_on_fill and state.position:
+                gateway.submit_stop_order(
+                    side=signal.side,
+                    quantity=qty,
+                    stop_price=state.position.stop_price,
+                    reason="initial_hard_stop",
+                )
+        else:
             order_type = str(result.get("order_type") or "MARKET").upper()
             order_id = str(result.get("order_id") or "")
             if order_type == "LIMIT" and order_id:
@@ -524,7 +589,7 @@ def _execute_entry(
                 order_id or result.get("order_id"),
             )
             state.position = None
-            _clear_position_if_gateway_flat(state, gateway    )
+            _clear_position_if_gateway_flat(state, gateway)
 
 
 def _maybe_poll_pending_entry_fill(
@@ -565,6 +630,8 @@ def _maybe_poll_adverse_entry_cancel(
     now = time.monotonic()
     elapsed = now - pending.submit_ts
     timeout = float(config.entry.entry_cancel_timeout_sec or 45)
+    if config.is_mes_es_nq_mode() and config.mes_execution.entry_timeout_ms > 0:
+        timeout = config.mes_execution.entry_timeout_ms / 1000.0
     if elapsed >= timeout:
         gateway.cancel_order(pending.order_id, reason="entry_timeout_45s")
         state.pending_entry = None
@@ -576,7 +643,7 @@ def _maybe_poll_adverse_entry_cancel(
         return
 
     snap, _ = build_intrabar_snapshot_row(
-        config.symbol[:3],
+        _signal_orderflow_root(config),
         minute_bar_row=row,
         cvd_at_minute_open=state.minute_open_cvd,
         prev_poll_row=state.prev_burst_poll_row,
@@ -635,7 +702,7 @@ def _maybe_poll_flow_exit(
     state.last_flow_exit_poll_ts = now
 
     snap, cvd_open = build_intrabar_snapshot_row(
-        config.symbol[:3],
+        _execution_orderflow_root(config) if config.is_mes_es_nq_mode() else _signal_orderflow_root(config),
         minute_bar_row=row,
         cvd_at_minute_open=state.minute_open_cvd,
         prev_poll_row=state.prev_burst_poll_row,
@@ -694,7 +761,7 @@ def _maybe_poll_flow_burst(
     state.last_flow_burst_poll_ts = now
 
     snap, cvd_open = build_intrabar_snapshot_row(
-        config.symbol[:3],
+        _execution_orderflow_root(config) if config.is_mes_es_nq_mode() else _signal_orderflow_root(config),
         minute_bar_row=row,
         cvd_at_minute_open=state.minute_open_cvd,
         prev_poll_row=state.prev_burst_poll_row,

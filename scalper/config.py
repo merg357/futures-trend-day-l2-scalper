@@ -2,11 +2,55 @@
 
 from __future__ import annotations
 
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field
+
+
+class StrategyMode(str, Enum):
+    """Runner mode — MNQ default; MES_ES_NQ_RAW_TEST for cross-instrument raw test."""
+
+    DEFAULT = ""
+    MES_ES_NQ_RAW_TEST = "MES_ES_NQ_RAW_TEST"
+
+
+class InstrumentRoutingConfig(BaseModel):
+    """Execution vs signal vs confirmation instrument roots (3-letter)."""
+
+    execution_instrument: str = ""
+    signal_instrument: str = ""
+    confirmation_instrument: str = ""
+
+
+class FilterFlagsConfig(BaseModel):
+    """Optional gates — defaults preserve legacy MNQ behavior when omitted."""
+
+    use_session_filter: bool = True
+    use_time_filter: bool = True
+    use_news_filter: bool = False
+    use_daily_loss_limit: bool = True
+    use_trade_cap: bool = True
+    use_cooldown: bool = True
+    use_take_profit: bool = True
+    use_max_hold_time: bool = True
+    use_signal_flip_exit: bool = True
+
+
+class NqConfirmationConfig(BaseModel):
+    use_nq_confirmation: bool = False
+    nq_veto_threshold: float = 55.0
+
+
+class MesExecutionConfig(BaseModel):
+    max_spread_ticks: int = 2
+    entry_chase_ticks: int = 1
+    entry_timeout_ms: int = 400
+    quote_max_age_sec: float = 5.0
+    order_id_prefix: str = "L2MES"
+    submit_hard_stop_on_fill: bool = True
 
 
 class SessionConfig(BaseModel):
@@ -99,6 +143,7 @@ class ExitConfig(BaseModel):
     trailing_enabled: bool = True
     trailing_trigger_ticks: int = 15
     trailing_offset_ticks: int = 5
+    trailing_step_ticks: int = 0  # 0 = continuous trail; >0 = step trail by ticks
     max_hold_bars: int = 0  # 0 = disabled
     l2_reversal_exit_enabled: bool = True
     l2_reversal_threshold: float = 35.0
@@ -128,11 +173,16 @@ class OptimizeConfig(BaseModel):
 
 class ScalperConfig(BaseModel):
     symbol: str
+    mode: str = ""
     instrument_family: str = "NQ"
     tick_size: float = 0.25
     tick_value: float = 0.50
     point_value: float = 2.0
     contract_multiplier: float = 2.0
+    routing: InstrumentRoutingConfig = Field(default_factory=InstrumentRoutingConfig)
+    filters: FilterFlagsConfig = Field(default_factory=FilterFlagsConfig)
+    nq_confirmation: NqConfirmationConfig = Field(default_factory=NqConfirmationConfig)
+    mes_execution: MesExecutionConfig = Field(default_factory=MesExecutionConfig)
     session: SessionConfig = Field(default_factory=SessionConfig)
     trend: TrendConfig = Field(default_factory=TrendConfig)
     l2: L2Config = Field(default_factory=L2Config)
@@ -142,6 +192,39 @@ class ScalperConfig(BaseModel):
     risk: RiskConfig = Field(default_factory=RiskConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     optimize: OptimizeConfig = Field(default_factory=OptimizeConfig)
+
+    def strategy_mode(self) -> StrategyMode:
+        raw = str(self.mode or "").strip().upper()
+        if raw == StrategyMode.MES_ES_NQ_RAW_TEST.value:
+            return StrategyMode.MES_ES_NQ_RAW_TEST
+        return StrategyMode.DEFAULT
+
+    def is_mes_es_nq_mode(self) -> bool:
+        return self.strategy_mode() == StrategyMode.MES_ES_NQ_RAW_TEST
+
+    def _root(self, explicit: str, fallback_symbol: bool = True) -> str:
+        val = str(explicit or "").strip().upper()
+        if val:
+            return val[:3]
+        if fallback_symbol:
+            return str(self.symbol or "MNQ").upper()[:3]
+        return ""
+
+    def execution_root(self) -> str:
+        return self._root(self.routing.execution_instrument)
+
+    def signal_root(self) -> str:
+        routed = self._root(self.routing.signal_instrument, fallback_symbol=False)
+        return routed or self.execution_root()
+
+    def confirmation_root(self) -> str:
+        return self._root(self.routing.confirmation_instrument, fallback_symbol=False)
+
+    def orderflow_root_for_signal(self) -> str:
+        return self.signal_root()
+
+    def orderflow_root_for_execution(self) -> str:
+        return self.execution_root()
 
 
 def load_config(path: str | Path) -> ScalperConfig:

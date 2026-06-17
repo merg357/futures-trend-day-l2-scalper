@@ -163,6 +163,7 @@ def _nt8_client_command(
     order_type: str,
     order_id: str,
     limit_price: float = 0.0,
+    stop_price: float = 0.0,
 ) -> bool:
     ps_cmd = (
         f'$asm = [System.Reflection.Assembly]::LoadFile("{_NT8_DLL}"); '
@@ -171,7 +172,7 @@ def _nt8_client_command(
         f'Start-Sleep -Milliseconds 500; '
         f'$c.ConfirmOrders(0); '
         f'$r = $c.Command("{command}", "{account}", "{instrument}", "{action}", '
-        f'{qty}, "{order_type}", {limit_price}, 0.0, "DAY", "", "{order_id}", "", ""); '
+        f'{qty}, "{order_type}", {limit_price}, {stop_price}, "DAY", "", "{order_id}", "", ""); '
         f'$c.TearDown(); '
         f'exit $r'
     )
@@ -204,14 +205,24 @@ def _nt8_client_command(
 class LiveGateway:
     """Broker adapter — sends NT8 demo orders when NT8_DEMO_ORDERS=true."""
 
-    def __init__(self, log_dir: str | Path = "data/live") -> None:
+    def __init__(
+        self,
+        log_dir: str | Path = "data/live",
+        *,
+        execution_symbol: str | None = None,
+        order_prefix: str | None = None,
+    ) -> None:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._audit_path = self.log_dir / "gateway_audit.jsonl"
         self._connected = False
         self._order_seq = 0
         self._account = _nt8_account()
-        self._instrument = _resolve_instrument(os.getenv("SCALPER_SYMBOL", "MNQ"))
+        sym = execution_symbol or os.getenv("SCALPER_SYMBOL", "MNQ")
+        self._execution_symbol = str(sym).upper()[:3]
+        if order_prefix:
+            os.environ["NT8_ORDER_PREFIX"] = order_prefix
+        self._instrument = _resolve_instrument(sym)
 
     def connect(self) -> bool:
         self._connected = True
@@ -338,6 +349,52 @@ class LiveGateway:
             logger.info("NT8 cancel OK: id=%s reason=%s", oid, reason)
         return payload
 
+    def submit_stop_order(
+        self,
+        *,
+        side: Side,
+        quantity: int,
+        stop_price: float,
+        reason: str = "initial_stop",
+    ) -> dict[str, Any]:
+        """Submit protective STOP order after entry fill (MES raw test)."""
+        payload: dict[str, Any] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "action": "stop",
+            "symbol": self._execution_symbol,
+            "side": side.value,
+            "quantity": quantity,
+            "stop_price": stop_price,
+            "reason": reason,
+            "account": self._account,
+            "instrument": self._instrument,
+        }
+        if not nt8_orders_enabled():
+            payload["status"] = "blocked_paper_mode"
+            self._audit("stop_blocked", payload)
+            return payload
+        require_live_trading("submit_stop_order")
+        qty = max(1, int(quantity or 1))
+        tag = reason.replace(" ", "_")[:20] or "STOP"
+        order_id = self._next_order_id(f"STP_{tag}")
+        nt8_action = "SELL" if side == Side.LONG else "BUYTOCOVER"
+        ok = _nt8_client_command(
+            "PLACE",
+            self._account,
+            self._instrument,
+            nt8_action,
+            qty,
+            "STOPMARKET",
+            order_id,
+            0.0,
+            float(stop_price),
+        )
+        payload["status"] = "submitted" if ok else "nt8_rejected"
+        payload["order_id"] = order_id
+        payload["nt8_action"] = nt8_action
+        self._audit("stop_submitted" if ok else "stop_failed", payload)
+        return payload
+
     def submit_order(self, request: OrderRequest) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -367,21 +424,29 @@ class LiveGateway:
             self.cancel_orphan_orders(reason="pre_entry", before_entry=True)
             nt8_action = "BUY" if request.side == Side.LONG else "SELLSHORT"
             order_id = self._next_order_id(f"ENT_{tag}")
-            try:
-                import sys
+            chase_ticks = float(os.getenv("MES_ENTRY_CHASE_TICKS", "0") or 0)
+            use_marketable_limit = chase_ticks > 0 and request.price and request.price > 0
+            if use_marketable_limit:
+                entry_type = "LIMIT"
+                tick = float(os.getenv("MES_TICK_SIZE", "0.25") or 0.25)
+                chase = chase_ticks * tick
+                limit_px = float(request.price) + chase if request.side == Side.LONG else float(request.price) - chase
+            else:
+                try:
+                    import sys
 
-                fb_root = os.getenv("FUTURESBOT_ROOT", r"C:\FuturesBot")
-                if fb_root not in sys.path:
-                    sys.path.insert(0, fb_root)
-                from nt8_market_sanity import demo_entry_order_spec
+                    fb_root = os.getenv("FUTURESBOT_ROOT", r"C:\FuturesBot")
+                    if fb_root not in sys.path:
+                        sys.path.insert(0, fb_root)
+                    from nt8_market_sanity import demo_entry_order_spec
 
-                entry_type, limit_px = demo_entry_order_spec(
-                    str(request.symbol or "MNQ"),
-                    float(request.price or 0) or None,
-                    side=request.side.value,
-                )
-            except Exception:
-                entry_type, limit_px = "MARKET", 0.0
+                    entry_type, limit_px = demo_entry_order_spec(
+                        str(request.symbol or self._execution_symbol),
+                        float(request.price or 0) or None,
+                        side=request.side.value,
+                    )
+                except Exception:
+                    entry_type, limit_px = "MARKET", 0.0
             sanity_px = float(limit_px if entry_type == "LIMIT" and limit_px else (request.price or 0) or 0)
             if sanity_px > 0:
                 blocked, block_reason = _market_sanity_block(

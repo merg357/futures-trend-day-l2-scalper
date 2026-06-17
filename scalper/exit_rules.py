@@ -73,7 +73,13 @@ def init_position(
     config: ScalperConfig,
 ) -> Position:
     stop = _ticks_to_price(config.exit.stop_loss_ticks, config.tick_size, entry_price, side, favorable=False)
-    target = _ticks_to_price(config.exit.take_profit_ticks, config.tick_size, entry_price, side, favorable=True)
+    use_tp = config.filters.use_take_profit and config.exit.take_profit_ticks > 0
+    if use_tp:
+        target = _ticks_to_price(config.exit.take_profit_ticks, config.tick_size, entry_price, side, favorable=True)
+    else:
+        # Unreachable target when TP disabled (MES raw test).
+        huge = entry_price + 10000 * config.tick_size if side == Side.LONG else entry_price - 10000 * config.tick_size
+        target = huge
     return Position(
         side=side,
         entry_price=entry_price,
@@ -131,28 +137,40 @@ def _apply_trailing(
         return
     trigger = cfg.trailing_trigger_ticks * tick_size
     trail = cfg.trailing_offset_ticks * tick_size
+    step = cfg.trailing_step_ticks * tick_size if cfg.trailing_step_ticks > 0 else 0.0
     if pos.side == Side.LONG:
         if eff_high >= pos.entry_price + trigger:
             pos.trailing_active = True
         if pos.trailing_active:
-            pos.stop_price = max(pos.stop_price, pos.highest_price - trail)
+            candidate = pos.highest_price - trail
+            if step > 0:
+                if candidate > pos.stop_price + step:
+                    pos.stop_price = pos.stop_price + step
+            else:
+                pos.stop_price = max(pos.stop_price, candidate)
     else:
         if eff_low <= pos.entry_price - trigger:
             pos.trailing_active = True
         if pos.trailing_active:
-            pos.stop_price = min(pos.stop_price, pos.lowest_price + trail)
+            candidate = pos.lowest_price + trail
+            if step > 0:
+                if candidate < pos.stop_price - step:
+                    pos.stop_price = pos.stop_price - step
+            else:
+                pos.stop_price = min(pos.stop_price, candidate)
 
 
 def _check_stop_target(
-    pos: Position, eff_high: float, eff_low: float,
+    pos: Position, eff_high: float, eff_low: float, config: ScalperConfig,
 ) -> tuple[float | None, ExitReason | None]:
+    use_tp = config.filters.use_take_profit and config.exit.take_profit_ticks > 0
     if pos.side == Side.LONG:
         if eff_low <= pos.stop_price:
             reason = ExitReason.TRAILING if pos.trailing_active else (
                 ExitReason.BREAKEVEN if pos.breakeven_active else ExitReason.STOP
             )
             return pos.stop_price, reason
-        if eff_high >= pos.target_price:
+        if use_tp and eff_high >= pos.target_price:
             return pos.target_price, ExitReason.TARGET
     else:
         if eff_high >= pos.stop_price:
@@ -160,7 +178,7 @@ def _check_stop_target(
                 ExitReason.BREAKEVEN if pos.breakeven_active else ExitReason.STOP
             )
             return pos.stop_price, reason
-        if eff_low <= pos.target_price:
+        if use_tp and eff_low <= pos.target_price:
             return pos.target_price, ExitReason.TARGET
     return None, None
 
@@ -188,9 +206,11 @@ def evaluate_flow_exit(
     _apply_breakeven(pos, eff_high, eff_low, config.exit, config.tick_size)
     _apply_trailing(pos, eff_high, eff_low, config.exit, config.tick_size)
 
-    if flow_exit_delta_flip(snap, pos.side, config.flow):
+    if not config.filters.use_signal_flip_exit:
+        pass
+    elif flow_exit_delta_flip(snap, pos.side, config.flow):
         return mid, ExitReason.FLOW_DELTA_FLIP
-    if flow_exit_mbo_reversal(snap, pos.side, config.flow):
+    elif flow_exit_mbo_reversal(snap, pos.side, config.flow):
         return mid, ExitReason.FLOW_MBO_REVERSAL
 
     if pos.trailing_active or pos.breakeven_active:
@@ -214,12 +234,12 @@ def evaluate_exit(
     _apply_breakeven(pos, eff_high, eff_low, config.exit, config.tick_size)
     _apply_trailing(pos, eff_high, eff_low, config.exit, config.tick_size)
 
-    price, reason = _check_stop_target(pos, eff_high, eff_low)
+    price, reason = _check_stop_target(pos, eff_high, eff_low, config)
     if price is not None:
         return price, reason
 
     max_hold = config.exit.max_hold_bars
-    if max_hold > 0 and bar_index - pos.entry_bar >= max_hold:
+    if config.filters.use_max_hold_time and max_hold > 0 and bar_index - pos.entry_bar >= max_hold:
         return float(bar["close"]), ExitReason.MAX_TIME
 
     if _l2_reversal(bar, pos, config):
