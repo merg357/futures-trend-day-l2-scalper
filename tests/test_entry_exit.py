@@ -29,8 +29,8 @@ def test_is_session_end_false_at_2043_et() -> None:
 def test_is_session_end_inactive_when_disabled() -> None:
     cfg = _production_config()
     bar_time = datetime(2026, 6, 16, 15, 57)
-    assert cfg.exit.exit_at_session_end is False
-    assert is_session_end(bar_time, cfg) is False
+    assert cfg.exit.exit_at_session_end is True
+    assert is_session_end(bar_time, cfg) is True
 
 
 def test_rth_entry_not_blocked_outside_rth() -> None:
@@ -168,32 +168,29 @@ def test_flat_bar_short_updates_lowest_price_from_bid() -> None:
 
 
 def test_flat_bar_short_triggers_breakeven_when_bid_16_ticks_below_entry() -> None:
-    """Bid 16 ticks below entry on flat bar should arm breakeven for SHORT."""
+    """Bid 16 ticks below entry on flat bar should arm breakeven (not trail) for SHORT."""
     cfg = _production_config()
     entry = 30519.29
-    close = 30519.54
     bid = entry - 16 * cfg.tick_size
+    ask = bid + cfg.tick_size
     pos = init_position(Side.SHORT, entry, 10, datetime(2026, 6, 16, 20, 43), 1, cfg)
-    bar = _flat_bar_series(close, bid, close + 0.13)
+    bar = _flat_bar_series(bid, bid, ask)
 
     price, reason = evaluate_exit(pos, bar, 11, datetime(2026, 6, 16, 20, 44), cfg)
 
     assert pos.lowest_price == bid
     assert pos.breakeven_active is True
-    assert pos.trailing_active is True
-    expected_stop = bid + cfg.exit.trailing_offset_ticks * cfg.tick_size
-    assert pos.stop_price == expected_stop
-    # Ask on flat bar can hit tightened trail stop on same evaluation
-    assert price == pos.stop_price
-    assert reason == ExitReason.TRAILING
+    assert pos.trailing_active is False
+    assert price is None
+    assert reason is None
 
 
-def test_flat_bar_short_breakeven_at_exactly_15_ticks_favorable() -> None:
-    """Bid exactly 15 ticks below entry arms BE on flat bar."""
+def test_flat_bar_short_trailing_at_20_ticks_favorable() -> None:
+    """Bid 20 ticks below entry arms trailing on flat bar (retuned trigger)."""
     cfg = _production_config()
     entry = 30519.29
     close = 30519.54
-    bid = entry - cfg.exit.breakeven_trigger_ticks * cfg.tick_size
+    bid = entry - cfg.exit.trailing_trigger_ticks * cfg.tick_size
     pos = init_position(Side.SHORT, entry, 10, datetime(2026, 6, 16, 20, 43), 1, cfg)
     bar = _flat_bar_series(close, bid, close + 0.13)
 
@@ -205,6 +202,23 @@ def test_flat_bar_short_breakeven_at_exactly_15_ticks_favorable() -> None:
     assert pos.stop_price == expected_stop
     assert price == expected_stop
     assert reason == ExitReason.TRAILING
+
+
+def test_flat_bar_short_breakeven_at_exactly_10_ticks_favorable() -> None:
+    """Bid exactly 10 ticks below entry arms BE on flat bar (retuned trigger)."""
+    cfg = _production_config()
+    entry = 30519.29
+    bid = entry - cfg.exit.breakeven_trigger_ticks * cfg.tick_size
+    ask = bid + cfg.tick_size
+    pos = init_position(Side.SHORT, entry, 10, datetime(2026, 6, 16, 20, 43), 1, cfg)
+    bar = _flat_bar_series(bid, bid, ask)
+
+    price, reason = evaluate_exit(pos, bar, 11, datetime(2026, 6, 16, 20, 44), cfg)
+
+    assert pos.breakeven_active is True
+    assert pos.trailing_active is False
+    assert price is None
+    assert reason is None
 
 
 def test_normal_bar_exit_unchanged_without_bid_ask_merge() -> None:
@@ -225,10 +239,10 @@ def test_normal_bar_exit_unchanged_without_bid_ask_merge() -> None:
     assert pos.highest_price == entry + 0.5
 
 
-def test_max_hold_disabled_when_zero() -> None:
-    """max_hold_bars=0 must not force MAX_TIME exit."""
+def test_max_hold_exits_at_five_bars() -> None:
+    """max_hold_bars=5 must force MAX_TIME exit."""
     cfg = _production_config()
-    assert cfg.exit.max_hold_bars == 0
+    assert cfg.exit.max_hold_bars == 5
     entry = 30519.29
     pos = init_position(Side.LONG, entry, 0, datetime(2026, 6, 16, 10, 0), 1, cfg)
     bar = pd.Series({
@@ -236,6 +250,6 @@ def test_max_hold_disabled_when_zero() -> None:
         "volume": 500, "bid_size": 100, "ask_size": 100,
         "bid_depth": 500, "ask_depth": 500, "delta": 0, "atr": 5, "bar_range": 0.5,
     })
-    price, reason = evaluate_exit(pos, bar, 9999, datetime(2026, 6, 16, 15, 0), cfg)
-    assert reason != ExitReason.MAX_TIME
-    assert price is None
+    price, reason = evaluate_exit(pos, bar, 5, datetime(2026, 6, 16, 10, 5), cfg)
+    assert reason == ExitReason.MAX_TIME
+    assert price == entry

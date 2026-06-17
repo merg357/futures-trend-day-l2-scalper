@@ -81,6 +81,8 @@ class EntryConfig(BaseModel):
     flow_burst_cooldown_sec: float = 30.0
     orderflow_poll_sec: float = 10.0
     orderflow_max_age_sec: float = 45.0
+    entry_cancel_timeout_sec: float = 45.0
+    entry_adverse_mid_ticks: int = 9
     pullback_required_for_burst: bool = False
     pullback_mode: bool = True
     min_bars_after_open: int = 0

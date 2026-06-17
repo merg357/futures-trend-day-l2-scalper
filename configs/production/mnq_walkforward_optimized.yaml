@@ -72,6 +72,8 @@ entry:
   flow_burst_cooldown_sec: 30
   orderflow_poll_sec: 10
   orderflow_max_age_sec: 45
+  entry_cancel_timeout_sec: 45
+  entry_adverse_mid_ticks: 9
   pullback_required_for_burst: false
   pullback_mode: false
   min_bars_after_open: 0
@@ -79,17 +81,17 @@ entry:
   rth_only: false
 exit:
   stop_loss_ticks: 30
-  take_profit_ticks: 200
+  take_profit_ticks: 50
   breakeven_enabled: true
-  breakeven_trigger_ticks: 15
+  breakeven_trigger_ticks: 10
   breakeven_offset_ticks: 1
   trailing_enabled: true
-  trailing_trigger_ticks: 15
-  trailing_offset_ticks: 5
-  max_hold_bars: 0  # 0 = disabled
-  l2_reversal_exit_enabled: true
+  trailing_trigger_ticks: 20
+  trailing_offset_ticks: 4
+  max_hold_bars: 5
+  l2_reversal_exit_enabled: false
   l2_reversal_threshold: 35.0
-  exit_at_session_end: false
+  exit_at_session_end: true
 risk:
   max_contracts: 1
   max_trades_per_session: 0  # 0 = disabled

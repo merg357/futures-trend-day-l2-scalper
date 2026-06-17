@@ -18,7 +18,14 @@ import pandas as pd
 from scalper.backtest import _apply_slippage, _calc_pnl, load_bars
 from scalper.config import ScalperConfig, load_config
 from scalper.entry_rules import evaluate_entry, evaluate_flow_burst_entry
-from scalper.exit_rules import evaluate_exit, init_position
+from scalper.exit_rules import (
+    adverse_entry_mid_moved_against,
+    evaluate_exit,
+    evaluate_flow_exit,
+    flow_exit_delta_flip,
+    flow_exit_mbo_reversal,
+    init_position,
+)
 from scalper.flow_signals import build_intrabar_snapshot_row, enrich_bar_from_orderflow
 from scalper.indicators import compute_indicators
 from scalper.live_gateway import LiveGateway, OrderAction, OrderRequest, is_entry_blocked
@@ -27,6 +34,16 @@ from scalper.risk import RiskManager
 from scalper.trading_safety import demo_nt8_orders_enabled, live_trading_enabled, paper_only_mode
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PendingEntry:
+    order_id: str
+    submit_ts: float
+    side: Side
+    limit_price: float
+    quantity: int
+    reason: str = ""
 
 
 @dataclass
@@ -41,12 +58,15 @@ class RunnerState:
     processed_timestamps: set[str] | None = None
     # Intrabar flow burst (L2/DOM + MBO counters via orderflow.json).
     last_flow_burst_poll_ts: float = 0.0
+    last_flow_exit_poll_ts: float = 0.0
     last_orderflow_poll_ts: float = 0.0
     last_flow_burst_entry_ts: float = 0.0
     flow_burst_entry_minute: str | None = None
+    flow_exit_minute: str | None = None
     minute_open_cvd: float | None = None
     current_minute_key: str | None = None
     prev_burst_poll_row: pd.Series | None = None
+    pending_entry: PendingEntry | None = None
 
 
 def _env_path(name: str, default: str) -> Path:
@@ -258,6 +278,13 @@ def _minute_key(ts: Any) -> str:
     return str(ts)[:16]
 
 
+def _intrabar_poll_sec(config: ScalperConfig) -> float:
+    return max(
+        float(config.entry.flow_burst_poll_sec or 0),
+        float(config.entry.orderflow_poll_sec or 0),
+    )
+
+
 def _sync_minute_state(state: RunnerState, row: pd.Series, config: ScalperConfig) -> None:
     """Reset per-minute burst guards when the forming bar minute changes."""
     key = _minute_key(row["timestamp"])
@@ -265,6 +292,7 @@ def _sync_minute_state(state: RunnerState, row: pd.Series, config: ScalperConfig
         return
     state.current_minute_key = key
     state.flow_burst_entry_minute = None
+    state.flow_exit_minute = None
     state.prev_burst_poll_row = None
     if config.entry.flow_burst_mode:
         snap, cvd_open = build_intrabar_snapshot_row(
@@ -316,6 +344,73 @@ def _mark_flow_burst_entry(state: RunnerState, row: pd.Series) -> None:
     state.last_flow_burst_entry_ts = time.monotonic()
 
 
+def _already_exited_this_minute(state: RunnerState, row: pd.Series) -> bool:
+    return state.flow_exit_minute == _minute_key(row["timestamp"])
+
+
+def _mark_flow_exit(state: RunnerState, row: pd.Series) -> None:
+    state.flow_exit_minute = _minute_key(row["timestamp"])
+
+
+def _execute_exit(
+    row: pd.Series,
+    state: RunnerState,
+    config: ScalperConfig,
+    risk: RiskManager,
+    *,
+    exit_price: float,
+    reason: ExitReason,
+    mode: str,
+    trades_path: Path,
+    gateway: LiveGateway | None,
+    trade_deduper: TradeLogDeduper | None,
+) -> Trade | None:
+    if state.position is None:
+        return None
+    ts = row["timestamp"]
+    if isinstance(ts, str):
+        ts = pd.to_datetime(ts)
+    fill = _apply_slippage(
+        exit_price, state.position.side, False,
+        config.backtest.slippage_ticks, config.tick_size,
+    )
+    comm = config.backtest.commission_per_side * state.position.quantity * 2
+    pnl, pnl_ticks = _calc_pnl(
+        state.position.side, state.position.entry_price, fill,
+        state.position.quantity, config.tick_size, config.tick_value,
+    )
+    pnl -= comm
+    trade = Trade(
+        side=state.position.side,
+        entry_time=state.position.entry_time,
+        exit_time=ts,
+        entry_price=state.position.entry_price,
+        exit_price=fill,
+        quantity=state.position.quantity,
+        pnl=pnl,
+        pnl_ticks=pnl_ticks,
+        commission=comm,
+        exit_reason=reason,
+        bars_held=state.bar_index - state.position.entry_bar,
+        entry_trend_score=state.entry_trend,
+        entry_l2_score=state.entry_l2,
+    )
+    risk.record_trade(trade)
+    _append_trade(trades_path, trade, mode, trade_deduper)
+    if gateway is not None:
+        gateway.submit_order(OrderRequest(
+            action=OrderAction.EXIT,
+            symbol=config.symbol,
+            side=state.position.side,
+            quantity=state.position.quantity,
+            price=fill,
+            reason=reason.value,
+        ))
+    state.position = None
+    state.cooldown = config.entry.cooldown_bars_after_exit
+    return trade
+
+
 def _resolve_entry_signal(
     row: pd.Series,
     prev: pd.Series,
@@ -362,6 +457,7 @@ def _execute_entry(
         return
     qty = risk.position_size()
     ts = row["timestamp"]
+    state.pending_entry = None
     state.position = init_position(signal.side, fill, state.bar_index, ts, qty, config)
     state.entry_trend = signal.trend_score
     state.entry_l2 = signal.l2_score
@@ -408,12 +504,162 @@ def _execute_entry(
             qty,
             order_type=str(result.get("order_type") or "MARKET"),
         ):
+            order_type = str(result.get("order_type") or "MARKET").upper()
+            order_id = str(result.get("order_id") or "")
+            if order_type == "LIMIT" and order_id:
+                state.pending_entry = PendingEntry(
+                    order_id=order_id,
+                    submit_ts=time.monotonic(),
+                    side=signal.side,
+                    limit_price=fill,
+                    quantity=qty,
+                    reason=signal.reason,
+                )
+                logger.info(
+                    "LIMIT entry working (not filled yet) id=%s side=%s px=%.2f",
+                    order_id, signal.side.value, fill,
+                )
             logger.warning(
                 "Entry submitted but NT8 not filled (%s) - rolling back model position",
-                result.get("order_id"),
+                order_id or result.get("order_id"),
             )
             state.position = None
-            _clear_position_if_gateway_flat(state, gateway)
+            _clear_position_if_gateway_flat(state, gateway    )
+
+
+def _maybe_poll_pending_entry_fill(
+    row: pd.Series,
+    state: RunnerState,
+    config: ScalperConfig,
+    gateway: LiveGateway | None,
+) -> None:
+    """Promote working LIMIT fill into in-memory position when NT8 confirms."""
+    pending = state.pending_entry
+    if pending is None or state.position is not None or gateway is None:
+        return
+    nt8_pos = gateway.query_market_position()
+    if _nt8_position_matches_entry(nt8_pos, pending.side, pending.quantity):
+        ts = row["timestamp"]
+        if isinstance(ts, str):
+            ts = pd.to_datetime(ts)
+        state.position = init_position(
+            pending.side, pending.limit_price, state.bar_index, ts, pending.quantity, config,
+        )
+        state.pending_entry = None
+        logger.info("Pending LIMIT filled — position synced side=%s", state.position.side.value)
+
+
+def _maybe_poll_adverse_entry_cancel(
+    row: pd.Series,
+    state: RunnerState,
+    config: ScalperConfig,
+    gateway: LiveGateway | None,
+) -> None:
+    """Cancel working L2SCALP_ENT LIMIT when flow turns against the order."""
+    pending = state.pending_entry
+    if pending is None or state.position is not None or gateway is None:
+        return
+    if not config.entry.use_flow_signals:
+        return
+
+    now = time.monotonic()
+    elapsed = now - pending.submit_ts
+    timeout = float(config.entry.entry_cancel_timeout_sec or 45)
+    if elapsed >= timeout:
+        gateway.cancel_order(pending.order_id, reason="entry_timeout_45s")
+        state.pending_entry = None
+        logger.info("Cancelled pending LIMIT (timeout %.0fs) id=%s", timeout, pending.order_id)
+        return
+
+    poll_sec = _intrabar_poll_sec(config)
+    if poll_sec > 0 and now - state.last_orderflow_poll_ts < poll_sec:
+        return
+
+    snap, _ = build_intrabar_snapshot_row(
+        config.symbol[:3],
+        minute_bar_row=row,
+        cvd_at_minute_open=state.minute_open_cvd,
+        prev_poll_row=state.prev_burst_poll_row,
+    )
+    if snap is None:
+        return
+    state.last_orderflow_poll_ts = now
+
+    mid = float(snap.get("close") or 0)
+    adverse_ticks = int(config.entry.entry_adverse_mid_ticks or 9)
+    hits = 0
+    if flow_exit_delta_flip(snap, pending.side, config.flow):
+        hits += 1
+    if flow_exit_mbo_reversal(snap, pending.side, config.flow):
+        hits += 1
+    if adverse_entry_mid_moved_against(
+        mid, pending.limit_price, pending.side, config.tick_size, adverse_ticks,
+    ):
+        hits += 1
+
+    if hits >= 2:
+        gateway.cancel_order(pending.order_id, reason="entry_adverse_flow")
+        state.pending_entry = None
+        logger.info(
+            "Cancelled pending LIMIT (adverse flow %d/3) id=%s side=%s",
+            hits, pending.order_id, pending.side.value,
+        )
+
+
+def _maybe_poll_flow_exit(
+    row: pd.Series,
+    state: RunnerState,
+    config: ScalperConfig,
+    risk: RiskManager,
+    *,
+    mode: str,
+    trades_path: Path,
+    gateway: LiveGateway | None,
+    trade_deduper: TradeLogDeduper | None,
+) -> None:
+    """Poll orderflow.json between bar closes for flow-based intrabar exits."""
+    if state.position is None or not config.entry.use_flow_signals:
+        return
+    if _already_exited_this_minute(state, row):
+        return
+
+    if gateway is not None:
+        _clear_position_if_gateway_flat(state, gateway)
+        if state.position is None:
+            return
+
+    now = time.monotonic()
+    poll_sec = _intrabar_poll_sec(config)
+    if poll_sec > 0 and now - state.last_flow_exit_poll_ts < poll_sec:
+        return
+    state.last_flow_exit_poll_ts = now
+
+    snap, cvd_open = build_intrabar_snapshot_row(
+        config.symbol[:3],
+        minute_bar_row=row,
+        cvd_at_minute_open=state.minute_open_cvd,
+        prev_poll_row=state.prev_burst_poll_row,
+    )
+    if snap is None:
+        return
+    if state.minute_open_cvd is None:
+        state.minute_open_cvd = cvd_open
+
+    exit_price, reason = evaluate_flow_exit(state.position, snap, config)
+    if exit_price is None or reason is None:
+        return
+
+    _mark_flow_exit(state, row)
+    _execute_exit(
+        row, state, config, risk,
+        exit_price=exit_price,
+        reason=reason,
+        mode=mode,
+        trades_path=trades_path,
+        gateway=gateway,
+        trade_deduper=trade_deduper,
+    )
+    logger.info("Flow intrabar exit: %s @ %.2f", reason.value, exit_price)
 
 
 def _maybe_poll_flow_burst(
@@ -434,16 +680,15 @@ def _maybe_poll_flow_burst(
         return
     if state.position is not None or state.cooldown > 0 or not risk.can_enter():
         return
+    if state.pending_entry is not None:
+        return
     if _flow_burst_cooldown_active(state, config):
         return
     if _already_entered_this_minute(state, row):
         return
 
     now = time.monotonic()
-    poll_sec = max(
-        float(config.entry.flow_burst_poll_sec or 0),
-        float(config.entry.orderflow_poll_sec or 0),
-    )
+    poll_sec = _intrabar_poll_sec(config)
     if now - state.last_flow_burst_poll_ts < poll_sec:
         return
     state.last_flow_burst_poll_ts = now
@@ -524,49 +769,28 @@ def process_bar(
             return new_trades
         exit_price, reason = evaluate_exit(state.position, row, i, ts, config)
         if exit_price is not None and reason is not None:
-            fill = _apply_slippage(
-                exit_price, state.position.side, False,
-                config.backtest.slippage_ticks, config.tick_size,
+            _mark_flow_exit(state, row)
+            trade = _execute_exit(
+                row, state, config, risk,
+                exit_price=exit_price,
+                reason=reason,
+                mode=mode,
+                trades_path=trades_path,
+                gateway=gateway,
+                trade_deduper=trade_deduper,
             )
-            comm = config.backtest.commission_per_side * state.position.quantity * 2
-            pnl, pnl_ticks = _calc_pnl(
-                state.position.side, state.position.entry_price, fill,
-                state.position.quantity, config.tick_size, config.tick_value,
-            )
-            pnl -= comm
-            trade = Trade(
-                side=state.position.side,
-                entry_time=state.position.entry_time,
-                exit_time=ts,
-                entry_price=state.position.entry_price,
-                exit_price=fill,
-                quantity=state.position.quantity,
-                pnl=pnl,
-                pnl_ticks=pnl_ticks,
-                commission=comm,
-                exit_reason=reason,
-                bars_held=i - state.position.entry_bar,
-                entry_trend_score=state.entry_trend,
-                entry_l2_score=state.entry_l2,
-            )
-            new_trades.append(trade)
-            risk.record_trade(trade)
-            _append_trade(trades_path, trade, mode, trade_deduper)
-            if gateway is not None:
-                gateway.submit_order(OrderRequest(
-                    action=OrderAction.EXIT,
-                    symbol=config.symbol,
-                    side=state.position.side,
-                    quantity=state.position.quantity,
-                    price=fill,
-                    reason=reason.value,
-                ))
-            state.position = None
-            state.cooldown = config.entry.cooldown_bars_after_exit
+            if trade is not None:
+                new_trades.append(trade)
+            state.bar_index += 1
+            return new_trades
         state.bar_index += 1
         return new_trades
 
     if not risk.can_enter():
+        state.bar_index += 1
+        return new_trades
+
+    if state.pending_entry is not None:
         state.bar_index += 1
         return new_trades
 
@@ -821,6 +1045,15 @@ def run_follow(
             prev_row = df.iloc[-2]
             state.bar_index = len(df) - 1
             _sync_minute_state(state, last_row, config)
+            _maybe_poll_pending_entry_fill(last_row, state, config, gateway)
+            _maybe_poll_adverse_entry_cancel(last_row, state, config, gateway)
+            _maybe_poll_flow_exit(
+                last_row, state, config, risk,
+                mode="follow",
+                trades_path=trades_path,
+                gateway=gateway,
+                trade_deduper=trade_deduper,
+            )
             _maybe_poll_flow_burst(
                 last_row, prev_row, state, config, risk,
                 mode="follow",

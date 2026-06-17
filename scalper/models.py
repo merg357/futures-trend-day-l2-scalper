@@ -30,6 +30,10 @@ class ExitReason(str, Enum):
     L2_REVERSAL = "l2_reversal"
     SESSION_END = "session_end"
     MANUAL = "manual"
+    FLOW_DELTA_FLIP = "flow_exit_delta_flip"
+    FLOW_MBO_REVERSAL = "flow_exit_mbo_reversal"
+    FLOW_TRAIL_INTRABAR = "flow_exit_trail_intrabar"
+    ENTRY_ADVERSE_CANCEL = "entry_adverse_cancel"
 
 
 @dataclass

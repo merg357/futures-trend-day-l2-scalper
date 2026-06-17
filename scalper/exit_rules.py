@@ -6,11 +6,55 @@ from datetime import datetime
 
 import pandas as pd
 
-from scalper.config import ExitConfig, ScalperConfig
+from scalper.config import ExitConfig, FlowConfig, ScalperConfig
 from scalper.entry_rules import _is_synthetic_flat_bar
 from scalper.session_utils import is_session_end
 from scalper.l2_score import compute_l2_score
 from scalper.models import ExitReason, Position, Side
+
+
+def _num(row: pd.Series, key: str, default: float = 0.0) -> float:
+    val = row.get(key, default)
+    if pd.isna(val):
+        return default
+    return float(val)
+
+
+def flow_exit_delta_flip(row: pd.Series, side: Side, flow: FlowConfig) -> bool:
+    """Exit when intrabar delta crosses opposite-side entry threshold."""
+    delta = _num(row, "delta")
+    if side == Side.LONG:
+        return delta <= flow.short_delta_max
+    return delta >= flow.long_delta_min
+
+
+def flow_exit_mbo_reversal(row: pd.Series, side: Side, flow: FlowConfig) -> bool:
+    """Exit when MBO new-order skew flips against the position."""
+    bid_new = _num(row, "mbo_bid_new_count")
+    ask_new = _num(row, "mbo_ask_new_count")
+    ratio = flow.book_size_ratio
+    if side == Side.LONG:
+        if bid_new <= 0:
+            return ask_new > 0
+        return ask_new / bid_new >= ratio
+    if ask_new <= 0:
+        return bid_new > 0
+    return bid_new / ask_new >= ratio
+
+
+def adverse_entry_mid_moved_against(
+    mid: float,
+    limit_price: float,
+    side: Side,
+    tick_size: float,
+    adverse_ticks: int,
+) -> bool:
+    if mid <= 0 or limit_price <= 0:
+        return False
+    threshold = adverse_ticks * tick_size
+    if side == Side.LONG:
+        return mid <= limit_price - threshold
+    return mid >= limit_price + threshold
 
 
 def _ticks_to_price(ticks: int, tick_size: float, base: float, side: Side, favorable: bool) -> float:
@@ -126,6 +170,36 @@ def _l2_reversal(row: pd.Series, pos: Position, config: ScalperConfig) -> bool:
         return False
     l2 = compute_l2_score(row, pos.side, config.l2)
     return l2.score < config.exit.l2_reversal_threshold
+
+
+def evaluate_flow_exit(
+    pos: Position,
+    snap: pd.Series,
+    config: ScalperConfig,
+) -> tuple[float | None, ExitReason | None]:
+    """Intrabar flow-based exit using live orderflow snapshot (mid + MBO + delta)."""
+    mid = float(snap.get("close") or snap.get("bid") or 0)
+    if mid <= 0:
+        return None, None
+
+    eff_high = max(pos.highest_price, mid)
+    eff_low = min(pos.lowest_price, mid)
+    _update_extremes(pos, eff_high, eff_low)
+    _apply_breakeven(pos, eff_high, eff_low, config.exit, config.tick_size)
+    _apply_trailing(pos, eff_high, eff_low, config.exit, config.tick_size)
+
+    if flow_exit_delta_flip(snap, pos.side, config.flow):
+        return mid, ExitReason.FLOW_DELTA_FLIP
+    if flow_exit_mbo_reversal(snap, pos.side, config.flow):
+        return mid, ExitReason.FLOW_MBO_REVERSAL
+
+    if pos.trailing_active or pos.breakeven_active:
+        if pos.side == Side.LONG and mid <= pos.stop_price:
+            return mid, ExitReason.FLOW_TRAIL_INTRABAR
+        if pos.side == Side.SHORT and mid >= pos.stop_price:
+            return mid, ExitReason.FLOW_TRAIL_INTRABAR
+
+    return None, None
 
 
 def evaluate_exit(

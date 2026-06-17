@@ -297,6 +297,47 @@ class LiveGateway:
             logger.warning("orphan_guard failed (%s): %s", reason, exc)
             return payload
 
+    def cancel_order(self, order_id: str, *, reason: str = "") -> dict[str, Any]:
+        """Cancel one NT8 working order by bot order id."""
+        payload: dict[str, Any] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "order_id": order_id,
+            "reason": reason,
+            "account": self._account,
+            "instrument": self._instrument,
+        }
+        if not nt8_orders_enabled():
+            payload["status"] = "blocked_paper_mode"
+            self._audit("cancel_blocked", payload)
+            return payload
+        try:
+            oid = _enforce_bot_order_id(order_id)
+        except ValueError as exc:
+            payload["status"] = "invalid_order_id"
+            payload["error"] = str(exc)
+            self._audit("cancel_failed", payload)
+            return payload
+        try:
+            import sys
+
+            fb_root = os.getenv("FUTURESBOT_ROOT", r"C:\FuturesBot")
+            if fb_root not in sys.path:
+                sys.path.insert(0, fb_root)
+            from l2_nt8_orphan_guard import _cancel_nt8_order
+
+            ok = _cancel_nt8_order(self._account, self._instrument, oid)
+        except Exception as exc:
+            payload["status"] = "cancel_error"
+            payload["error"] = str(exc)
+            self._audit("cancel_failed", payload)
+            logger.warning("cancel_order failed id=%s: %s", oid, exc)
+            return payload
+        payload["status"] = "cancelled" if ok else "cancel_failed"
+        self._audit("order_cancelled" if ok else "cancel_failed", payload)
+        if ok:
+            logger.info("NT8 cancel OK: id=%s reason=%s", oid, reason)
+        return payload
+
     def submit_order(self, request: OrderRequest) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
