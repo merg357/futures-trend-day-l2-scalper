@@ -176,3 +176,43 @@ def test_pending_entry_submit_ts_uses_order_submit(monkeypatch, tmp_path) -> Non
 def test_adverse_mid_cancel_ticks_12(mes_config) -> None:
     assert mes_config.entry.entry_adverse_mid_ticks == 12
     assert mes_config.entry.use_adverse_mid_cancel is True
+
+
+def test_trend_filter_disabled_for_raw_test(mes_config) -> None:
+    assert mes_config.trend.use_trend_filter is False
+    assert mes_config.trend.require_trend_alignment is False
+    assert mes_config.trend.min_trend_score == 0
+
+
+def test_flow_burst_allows_counter_trend_when_filter_off(mes_config) -> None:
+    """Weak flow (below flow_strong_score) must enter against trend when filter disabled."""
+    from datetime import datetime
+
+    from scalper.entry_rules import evaluate_flow_burst_entry
+    from scalper.models import Bias
+
+    close = 7494.0
+    row = pd.Series({
+        "open": close, "high": close + 1.0, "low": close - 1.0, "close": close,
+        "volume": 500, "bid": close, "ask": close + 0.25,
+        "bid_size": 5.0, "ask_size": 2.0, "bid_depth": 80.0, "ask_depth": 30.0,
+        "delta": 12.0, "imbalance": 0.7, "atr": 5.0, "bar_range": 2.0,
+        "ema_fast": close - 2.0, "ema_slow": close - 1.0, "ema_trend": close - 3.0,
+        "vwap": close - 1.0, "adx": 25.0, "higher_high": 1.0, "lower_low": 0.0,
+    })
+    prev = row.copy()
+    prev["ask_size"] = 8.0
+    prev["delta"] = 2.0
+    sig = evaluate_flow_burst_entry(
+        row,
+        5.0,
+        100,
+        mes_config,
+        cooldown_remaining=0,
+        session_bar_index=10,
+        bar_time=datetime(2026, 6, 18, 9, 0),
+        prev_row=prev,
+        trend_row=row,
+    )
+    assert sig is not None
+    assert sig.side.value == "LONG"

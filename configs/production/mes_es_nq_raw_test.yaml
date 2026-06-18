@@ -57,7 +57,9 @@ trend:
   adx_trend_min: 22.0
   atr_period: 14
   atr_expansion_mult: 1.1
-  min_trend_score: 35
+  use_trend_filter: false
+  require_trend_alignment: false
+  min_trend_score: 0
   weight_ema: 25.0
   weight_vwap: 20.0
   weight_adx: 25.0

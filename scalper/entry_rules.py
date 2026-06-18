@@ -161,12 +161,13 @@ def evaluate_flow_burst_entry(
     side = flow_any.side
     trend_source = trend_row if trend_row is not None else row
     trend = compute_trend_score(trend_source, prev_atr, config.trend)
-    trend_aligns = (
-        (side == Side.LONG and trend.bias == Bias.LONG)
-        or (side == Side.SHORT and trend.bias == Bias.SHORT)
-    )
-    if not trend_aligns and flow_any.score < config.flow.flow_strong_score:
-        return None
+    if config.trend.use_trend_filter and config.trend.require_trend_alignment:
+        trend_aligns = (
+            (side == Side.LONG and trend.bias == Bias.LONG)
+            or (side == Side.SHORT and trend.bias == Bias.SHORT)
+        )
+        if not trend_aligns and flow_any.score < config.flow.flow_strong_score:
+            return None
 
     if config.entry.pullback_required_for_burst:
         bias = Bias.LONG if side == Side.LONG else Bias.SHORT
@@ -233,7 +234,11 @@ def evaluate_entry(
     effective_bias = flow_bias if flow_bias is not None else trend.bias
     if effective_bias == Bias.NONE:
         return None
-    if flow_bias is None and trend.score < min_trend:
+    if (
+        config.trend.use_trend_filter
+        and flow_bias is None
+        and trend.score < min_trend
+    ):
         return None
     if not _pullback_to_ema(row, effective_bias, config.tick_size, config.entry.pullback_to_ema_ticks):
         return None

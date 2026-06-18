@@ -83,6 +83,8 @@ class TrendConfig(BaseModel):
     adx_trend_min: float = 22.0
     atr_period: int = 14
     atr_expansion_mult: float = 1.1
+    use_trend_filter: bool = True
+    require_trend_alignment: bool = True
     min_trend_score: float = 58.0
     weight_ema: float = 25.0
     weight_vwap: float = 20.0
