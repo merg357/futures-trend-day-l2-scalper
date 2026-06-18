@@ -28,7 +28,7 @@ nq_confirmation:
   nq_obi_veto_threshold: 0.65
   nq_veto_min_flow_for_obi: 55.0
 mes_execution:
-  max_spread_ticks: 2
+  max_spread_ticks: 4
   entry_chase_ticks: 1
   entry_timeout_ms: 1500
   quote_max_age_sec: 5.0
@@ -96,7 +96,7 @@ entry:
   chop_adx_max: 18.0
   chop_range_atr_mult: 0.25
   pullback_to_ema_ticks: 3
-  max_spread_ticks: 2
+  max_spread_ticks: 4
   require_l2_confirmation: false
   use_flow_signals: true
   flow_burst_mode: true
