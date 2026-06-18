@@ -52,6 +52,8 @@ class MesExecutionConfig(BaseModel):
     entry_chase_ticks: int = 1
     entry_timeout_ms: int = 1500
     quote_max_age_sec: float = 5.0
+    mes_quote_stale_max_age_sec: float = 2.0
+    mes_quote_max_divergence_ticks: float = 4.0
     order_id_prefix: str = "L2MES"
     submit_hard_stop_on_fill: bool = True
     entry_order_mode: str = "MARKETABLE_LIMIT"

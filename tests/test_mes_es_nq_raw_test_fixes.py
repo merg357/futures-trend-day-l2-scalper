@@ -216,3 +216,73 @@ def test_flow_burst_allows_counter_trend_when_filter_off(mes_config) -> None:
     )
     assert sig is not None
     assert sig.side.value == "LONG"
+
+
+def test_mes_quote_stale_vs_es_divergence() -> None:
+    from scalper.flow_signals import mes_quote_stale_vs_es
+
+    mes_row = {
+        "ts": __import__("time").time(),
+        "mid_price": 7508.75,
+        "bid_levels": [{"price": 7508.5, "qty": 1}],
+        "ask_levels": [{"price": 7509.0, "qty": 1}],
+        "depth_event_count_60s": 0,
+    }
+    es_row = {
+        "ts": __import__("time").time(),
+        "mid_price": 7513.25,
+        "bid_levels": [{"price": 7513.0, "qty": 1}],
+        "ask_levels": [{"price": 7513.5, "qty": 1}],
+        "depth_event_count_60s": 12,
+        "synthetic_source": "mes_es_bar_bridge",
+    }
+    stale, reason = mes_quote_stale_vs_es(mes_row, es_row, tick_size=0.25, max_divergence_ticks=4.0)
+    assert stale is True
+    assert reason == "es_divergence"
+
+
+def test_resolve_mes_entry_price_uses_es_proxy_when_stale(mes_config) -> None:
+    import time
+    from unittest.mock import patch
+
+    from scalper.flow_signals import es_proxy_mes_row
+    from scalper.models import EntrySignal, Side
+    from scalper.paper_runner import _resolve_mes_entry_price
+
+    mes_row = {
+        "ts": time.time(),
+        "mid_price": 7508.75,
+        "bid_levels": [{"price": 7508.5, "qty": 1}],
+        "ask_levels": [{"price": 7509.0, "qty": 1}],
+        "depth_event_count_60s": 0,
+        "spread": 0.5,
+    }
+    es_row = {
+        "ts": time.time(),
+        "mid_price": 7513.25,
+        "bid_levels": [{"price": 7513.0, "qty": 1}],
+        "ask_levels": [{"price": 7513.5, "qty": 1}],
+        "depth_event_count_60s": 8,
+        "synthetic_source": "mes_es_bar_bridge",
+        "spread": 0.5,
+    }
+    signal = EntrySignal(
+        side=Side.LONG,
+        price=7512.0,
+        bar_index=10,
+        trend_score=80.0,
+        l2_score=70.0,
+        reason="flow_burst_long",
+    )
+
+    def _read(root, **kwargs):
+        return mes_row if root == "MES" else es_row
+
+    with patch("scalper.flow_signals._read_orderflow_instrument", side_effect=_read):
+        px, meta = _resolve_mes_entry_price(signal, mes_config)
+
+    assert meta["mes_quote_stale"] is True
+    assert meta["mes_quote_source"] == "es_proxy"
+    proxy = es_proxy_mes_row(es_row)
+    expected = float(proxy["ask_levels"][0]["price"]) + mes_config.mes_execution.entry_chase_ticks * mes_config.tick_size
+    assert px == expected

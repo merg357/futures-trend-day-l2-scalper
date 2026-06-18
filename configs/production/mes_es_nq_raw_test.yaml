@@ -32,6 +32,8 @@ mes_execution:
   entry_chase_ticks: 1
   entry_timeout_ms: 1500
   quote_max_age_sec: 5.0
+  mes_quote_stale_max_age_sec: 2.0
+  mes_quote_max_divergence_ticks: 4.0
   order_id_prefix: L2MES
   submit_hard_stop_on_fill: true
   entry_order_mode: MARKETABLE_LIMIT

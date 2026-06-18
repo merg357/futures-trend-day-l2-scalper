@@ -231,6 +231,74 @@ def flow_burst_passes(flow: FlowSignal, side: Side, cfg: FlowConfig) -> bool:
     return flow.score >= cfg.min_flow_score and flow.triggers_hit >= cfg.min_triggers
 
 
+def _orderflow_row_bbo(row: dict) -> tuple[float, float, float]:
+    bids = row.get("bid_levels") or []
+    asks = row.get("ask_levels") or []
+    bid = float(bids[0].get("price") or 0) if bids else 0.0
+    ask = float(asks[0].get("price") or 0) if asks else 0.0
+    mid = float(row.get("mid_price") or 0)
+    if mid <= 0 and bid > 0 and ask > 0:
+        mid = (bid + ask) / 2.0
+    elif mid <= 0 and bid > 0:
+        mid = bid
+    elif mid <= 0 and ask > 0:
+        mid = ask
+    return bid, ask, mid
+
+
+def mes_quote_stale_vs_es(
+    mes_row: dict,
+    es_row: dict,
+    *,
+    tick_size: float = 0.25,
+    max_age_sec: float = 2.0,
+    max_divergence_ticks: float = 4.0,
+) -> tuple[bool, str]:
+    """Detect frozen MES DOM vs fresh ES signal book (same price scale)."""
+    import time
+
+    now = time.time()
+    mes_ts = float(mes_row.get("ts") or 0)
+    if mes_ts > 0 and (now - mes_ts) > max_age_sec:
+        return True, "row_age"
+    _mb, _ma, mes_mid = _orderflow_row_bbo(mes_row)
+    _eb, _ea, es_mid = _orderflow_row_bbo(es_row)
+    if mes_mid > 0 and es_mid > 0:
+        if abs(mes_mid - es_mid) > max(float(max_divergence_ticks), 1.0) * tick_size:
+            return True, "es_divergence"
+    mes_depth = int(mes_row.get("depth_event_count_60s") or 0)
+    ctx_depth = int(es_row.get("depth_event_count_60s") or 0)
+    ctx_source = str(es_row.get("synthetic_source") or "")
+    if mes_depth == 0 and (ctx_depth > 0 or ctx_source):
+        bids = mes_row.get("bid_levels") or []
+        asks = mes_row.get("ask_levels") or []
+        stub_qty = sum(int(x.get("qty") or 0) for x in bids + asks)
+        if stub_qty <= 4 and mes_mid > 0 and es_mid > 0 and abs(mes_mid - es_mid) > tick_size:
+            return True, "mes_dom_silent"
+    if str(mes_row.get("synthetic_source") or "").startswith("es_proxy"):
+        return False, ""
+    return False, ""
+
+
+def es_proxy_mes_row(es_row: dict) -> dict:
+    """MES-compatible orderflow row from ES quote (MES trades at ES price scale)."""
+    bid, ask, mid = _orderflow_row_bbo(es_row)
+    tick = float(es_row.get("spread") or 0.25) or 0.25
+    if mid <= 0:
+        return es_row
+    if bid <= 0:
+        bid = mid - tick / 2.0
+    if ask <= 0:
+        ask = mid + tick / 2.0
+    proxy = dict(es_row)
+    proxy["bid_levels"] = [{"price": bid, "qty": 1}]
+    proxy["ask_levels"] = [{"price": ask, "qty": 1}]
+    proxy["mid_price"] = mid
+    proxy["spread"] = max(ask - bid, tick)
+    proxy["synthetic_source"] = "es_proxy_entry"
+    return proxy
+
+
 def _read_orderflow_instrument(
     root: str,
     *,

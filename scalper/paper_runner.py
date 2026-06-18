@@ -327,21 +327,64 @@ def _execution_symbol(config: ScalperConfig) -> str:
 
 
 def _resolve_mes_entry_price(signal, config: ScalperConfig) -> tuple[float | None, dict[str, Any]]:
-    """Fresh MES bid/ask for marketable limit; returns (price, quote_meta)."""
-    from scalper.flow_signals import enrich_bar_from_orderflow
+    """Fresh MES bid/ask for marketable limit; ES proxy when MES DOM frozen."""
+    from scalper.flow_signals import (
+        enrich_bar_from_orderflow,
+        es_proxy_mes_row,
+        mes_quote_stale_vs_es,
+        _read_orderflow_instrument,
+    )
 
     root = _execution_orderflow_root(config)
-    snap = enrich_bar_from_orderflow(
+    signal_root = _signal_orderflow_root(config)
+    mes_row = _read_orderflow_instrument(
         root,
-        pd.Series({"close": signal.price}),
+        max_age_sec=config.mes_execution.quote_max_age_sec,
+    )
+    es_row = _read_orderflow_instrument(
+        signal_root,
         max_age_sec=config.mes_execution.quote_max_age_sec,
     )
     meta: dict[str, Any] = {
         "mes_bid_at_submit": None,
         "mes_ask_at_submit": None,
         "mes_spread_at_submit": None,
+        "mes_quote_stale": False,
+        "mes_quote_stale_reason": None,
+        "mes_quote_source": "mes_dom",
         "cancel_reason": None,
     }
+    quote_row = mes_row
+    use_es_proxy = False
+    if mes_row is not None and es_row is not None:
+        stale, stale_reason = mes_quote_stale_vs_es(
+            mes_row,
+            es_row,
+            tick_size=config.tick_size,
+            max_age_sec=config.mes_execution.mes_quote_stale_max_age_sec,
+            max_divergence_ticks=config.mes_execution.mes_quote_max_divergence_ticks,
+        )
+        if stale:
+            quote_row = es_proxy_mes_row(es_row)
+            use_es_proxy = True
+            meta["mes_quote_stale"] = True
+            meta["mes_quote_stale_reason"] = stale_reason
+            meta["mes_quote_source"] = "es_proxy"
+    snap = enrich_bar_from_orderflow(
+        root,
+        pd.Series({"close": signal.price}),
+        max_age_sec=config.mes_execution.quote_max_age_sec,
+    )
+    if snap is None and quote_row is not None:
+        snap = pd.Series({"close": signal.price})
+    if snap is not None and use_es_proxy and quote_row is not None:
+        bid = float(quote_row["bid_levels"][0]["price"])
+        ask = float(quote_row["ask_levels"][0]["price"])
+        mid = float(quote_row.get("mid_price") or 0)
+        snap["bid"] = bid
+        snap["ask"] = ask
+        if mid > 0:
+            snap["close"] = mid
     if snap is None:
         meta["cancel_reason"] = "cancel_quote_stale"
         return None, meta
@@ -703,6 +746,9 @@ def _execute_entry(
             "mes_bid_at_submit": result.get("mes_bid_at_submit") or quote_meta.get("mes_bid_at_submit"),
             "mes_ask_at_submit": result.get("mes_ask_at_submit") or quote_meta.get("mes_ask_at_submit"),
             "mes_spread_at_submit": result.get("mes_spread_at_submit") or quote_meta.get("mes_spread_at_submit"),
+            "mes_quote_stale": quote_meta.get("mes_quote_stale"),
+            "mes_quote_stale_reason": quote_meta.get("mes_quote_stale_reason"),
+            "mes_quote_source": quote_meta.get("mes_quote_source"),
             "would_have_blocked_fill_divergence": result.get("would_have_blocked_fill_divergence"),
             "divergence_ticks": result.get("divergence_ticks"),
         }
