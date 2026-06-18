@@ -16,7 +16,6 @@ from pathlib import Path
 from scalper.config import load_config
 from scalper.live_gateway import LiveGateway
 from scalper.paper_runner import (
-    _acquire_single_instance,
     _bar_csv_missing_message,
     _enforce_runner_safety,
     resolve_bar_csv_path,
@@ -28,6 +27,55 @@ from scalper.trading_safety import demo_nt8_orders_enabled, paper_only_mode
 logger = logging.getLogger(__name__)
 
 _ENT_ORDER_MARKERS = ("_ENT_", "_ENT")
+_MES_ES_NQ_MUTEX = r"Global\FuturesBot.MesEsNqRunner"
+
+
+def _nt8_client_api_listening() -> bool:
+    """True when NT8 Client API port accepts TCP (36973 by default)."""
+    try:
+        fb_root = os.getenv("FUTURESBOT_ROOT", r"C:\FuturesBot")
+        if fb_root not in sys.path:
+            sys.path.insert(0, fb_root)
+        from nt8_fill_registry import nt8_client_port_open
+
+        host = os.getenv("NT8_CLIENT_HOST", "127.0.0.1")
+        port = int(os.getenv("NT8_CLIENT_PORT", "36973"))
+        return nt8_client_port_open(host, port, timeout=0.75)
+    except Exception as exc:
+        logger.debug("NT8 port probe skipped: %s", exc)
+        return False
+
+
+def _acquire_mes_es_nq_single_instance() -> None:
+    """One mes_es_nq_runner per machine (matches PS guard mutex name)."""
+    if os.name != "nt":
+        return
+    import atexit
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.CreateMutexW(None, True, _MES_ES_NQ_MUTEX)
+    if kernel32.GetLastError() == 183:
+        raise SystemExit("mes_es_nq_runner already running (mutex)")
+
+    state_dir = Path(os.getenv("L2_SCALPER_STATE_DIR", r"C:\Bots\futures-trend-day-l2-scalper\state"))
+    state_dir.mkdir(parents=True, exist_ok=True)
+    pid_file = state_dir / "mes_es_nq_runner.pid"
+    pid_file.write_text(str(os.getpid()), encoding="ascii")
+
+    def _cleanup() -> None:
+        try:
+            if pid_file.exists() and pid_file.read_text(encoding="ascii").strip() == str(os.getpid()):
+                pid_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            kernel32.ReleaseMutex(handle)
+            kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+    atexit.register(_cleanup)
 
 
 def _ent_order_prefix(config) -> str:
@@ -72,6 +120,8 @@ def mes_entry_blocked_reason(
     """Block duplicate MES entries when NT8 is non-flat or ENT is still working."""
     if gateway is None or not config.is_mes_es_nq_mode():
         return None
+    if not _nt8_client_api_listening():
+        return "nt8_client_api_down"
     if pending_entry is not None:
         return "pending_l2mes_ent_in_memory"
     pos = gateway.query_market_position()
@@ -160,7 +210,7 @@ def main() -> None:
         )
 
     _enforce_runner_safety()
-    _acquire_single_instance()
+    _acquire_mes_es_nq_single_instance()
     _apply_mes_env(config)
 
     logging.basicConfig(

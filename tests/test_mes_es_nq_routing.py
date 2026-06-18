@@ -187,15 +187,23 @@ def test_submit_stop_order_blocks_when_still_above_bid() -> None:
 def test_mes_entry_blocked_when_nt8_position_nonzero(mes_config) -> None:
     gw = LiveGateway(execution_symbol="MES", order_prefix="L2MES")
     gw.query_market_position = lambda: 1  # type: ignore[method-assign]
-    assert mes_entry_blocked_reason(gw, mes_config) == "mes_position_nonzero=1"
+    with patch("scalper.mes_es_nq_runner._nt8_client_api_listening", return_value=True):
+        assert mes_entry_blocked_reason(gw, mes_config) == "mes_position_nonzero=1"
 
 
 def test_mes_entry_blocked_when_pending_ent_working(mes_config) -> None:
     gw = LiveGateway(execution_symbol="MES", order_prefix="L2MES")
     gw.query_market_position = lambda: 0  # type: ignore[method-assign]
-    with patch(
-        "scalper.mes_es_nq_runner._has_working_ent_order",
-        return_value=(True, "L2MES_ENT_flow_burst_123_1"),
-    ):
-        reason = mes_entry_blocked_reason(gw, mes_config)
+    with patch("scalper.mes_es_nq_runner._nt8_client_api_listening", return_value=True):
+        with patch(
+            "scalper.mes_es_nq_runner._has_working_ent_order",
+            return_value=(True, "L2MES_ENT_flow_burst_123_1"),
+        ):
+            reason = mes_entry_blocked_reason(gw, mes_config)
     assert reason == "pending_l2mes_ent_working=L2MES_ENT_flow_burst_123_1"
+
+
+def test_mes_entry_blocked_when_nt8_client_api_down(mes_config) -> None:
+    gw = LiveGateway(execution_symbol="MES", order_prefix="L2MES")
+    with patch("scalper.mes_es_nq_runner._nt8_client_api_listening", return_value=False):
+        assert mes_entry_blocked_reason(gw, mes_config) == "nt8_client_api_down"
